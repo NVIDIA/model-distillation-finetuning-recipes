@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG NGC_BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+ARG NGC_BASE_IMAGE=nvcr.io/nvidia/pytorch:26.10-py3
 FROM ${NGC_BASE_IMAGE}
 
 ARG INSTALL_MAMBA_KERNELS=0
@@ -15,7 +15,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN python -m venv --system-site-packages /opt/composite-venv \
     && /opt/composite-venv/bin/python -m pip install \
-       "wandb==0.30.0" "datasets==5.0.1" "transformers>=5.6.0" \
+       "wandb==0.30.0" "datasets==5.0.1" "transformers>=5.6.0" "safetensors==0.8.0" \
     && /opt/composite-venv/bin/python -m pip install --no-deps \
        "peft==0.21.0" "accelerate==1.15.0" \
     && if [ "${INSTALL_MAMBA_KERNELS}" = "1" ]; then \
@@ -33,6 +33,6 @@ RUN python -m venv --system-site-packages /opt/composite-venv \
     && mkdir -p /tmp/gpu-home \
     && chmod 1777 /tmp/gpu-home
 
-WORKDIR /workspace/model-distillation-recipes
+WORKDIR /workspace/model-distillation-finetuning-recipes
 
 CMD ["bash"]

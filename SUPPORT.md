@@ -2,16 +2,16 @@
 
 ## Support Level
 
-Model Distillation Recipes is maintained by NVIDIA. Support is provided on a
-best-effort basis through the repository issue tracker; no response-time or
-resolution-time service-level agreement is provided.
+Model Distillation and Fine-Tuning Recipes is maintained by NVIDIA. Support is
+provided on a best-effort basis through the repository issue tracker; no
+response-time or resolution-time service-level agreement is provided.
 
 ## Supported Scope
 
 Supported project functionality includes:
 
-- The documented LoRA supervised fine-tuning and logit-level distillation
-  recipes.
+- The documented LoRA supervised fine-tuning, logit-level distillation, and
+  user-supplied decision-model fine-tuning recipes.
 - The model families, FSDP2 configurations, and chat templates explicitly
   listed in the README.
 - The documented direct `torchrun` and container workflows on compatible

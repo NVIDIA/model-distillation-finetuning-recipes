@@ -5,10 +5,10 @@
 """Verify FSDP2 chat dataloader: template, assistant mask, think tags, pool weights.
 
 Example:
-    python verify_fsdp2_dataloader.py \
+    python -m scripts.causal_lm.verify_dataloader \
         --tokenizer /path/to/model \
         --data /path/to/train.jsonl \
-        --chat_template ../configs/chat_template_qwen3_generation.jinja \
+        --chat_template configs/chat_template_qwen3_generation.jinja \
         --blended_loss_weight 0.5 --max_samples 4
 """
 
@@ -18,7 +18,9 @@ import argparse
 import sys
 
 import torch
-from fsdp2_common import (
+from transformers import AutoTokenizer
+
+from scripts.shared.fsdp2_common import (
     IGNORE_TOKEN_ID,
     ChatDataset,
     PadCollator,
@@ -27,7 +29,6 @@ from fsdp2_common import (
     resolve_think_token_ids,
     unit_interval_float,
 )
-from transformers import AutoTokenizer
 
 
 def get_args(argv=None):

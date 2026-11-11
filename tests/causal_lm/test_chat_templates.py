@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
+CONFIG_DIR = Path(__file__).resolve().parents[2] / "configs"
 
 
 @pytest.mark.parametrize(

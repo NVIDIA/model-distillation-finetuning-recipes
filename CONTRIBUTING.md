@@ -1,7 +1,7 @@
 # Contributing
 
-Thank you for your interest in Model Distillation Recipes. All contributors
-must follow `CODE_OF_CONDUCT.md`.
+Thank you for your interest in Model Distillation and Fine-Tuning Recipes.
+All contributors must follow `CODE_OF_CONDUCT.md`.
 
 ## Before You Start
 
