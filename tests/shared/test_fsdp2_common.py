@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fsdp2_common import (
+
+from scripts.shared import fsdp2_common
+from scripts.shared.fsdp2_common import (
     IGNORE_TOKEN_ID,
     build_lambda_weights,
     load_chat_template,
@@ -213,3 +215,37 @@ def test_load_dcp_checkpoint_restores_completed_step(monkeypatch):
         "model_state_dict": {"m": 1},
         "optim_state_dict": {"o": 2},
     }
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_dist_cleanup_does_not_add_a_collective(initialized, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fsdp2_common.dist, "is_initialized", lambda: initialized)
+    monkeypatch.setattr(
+        fsdp2_common.dist, "barrier", lambda: pytest.fail("teardown must not add a collective")
+    )
+    monkeypatch.setattr(fsdp2_common.dist, "destroy_process_group", lambda: calls.append("destroy"))
+
+    fsdp2_common.dist_cleanup()
+
+    assert calls == (["destroy"] if initialized else [])
+
+
+@pytest.mark.parametrize(
+    ("rows", "world_size", "batch_size", "batches"),
+    [(0, 2, 2, 0), (3, 2, 2, 0), (4, 4, 2, 0), (8, 4, 2, 1)],
+)
+def test_chat_dataloader_requires_a_complete_distributed_batch(
+    rows, world_size, batch_size, batches, monkeypatch
+):
+    dataset = [{"input_ids": [1, 2], "labels": [IGNORE_TOKEN_ID, 2]} for _ in range(rows)]
+    monkeypatch.setattr(fsdp2_common, "ChatDataset", lambda *_args: dataset)
+    arguments = ("data.jsonl", SimpleNamespace(pad_token_id=0), 128, None)
+    if batches == 0:
+        with pytest.raises(ValueError, match="at least.*one complete distributed batch"):
+            fsdp2_common.make_chat_dataloader(*arguments, batch_size, world_size, 0, 1234)
+    else:
+        _, _, loader = fsdp2_common.make_chat_dataloader(
+            *arguments, batch_size, world_size, 0, 1234
+        )
+        assert len(loader) == batches

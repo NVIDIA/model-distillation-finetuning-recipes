@@ -77,6 +77,14 @@ def positive_int(value):
     return parsed
 
 
+def positive_float(value):
+    """Parse a finite, strictly positive floating-point CLI value."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError(f"expected a finite positive value, got {value!r}")
+    return parsed
+
+
 def validate_tokenizer_compatibility(student_tokenizer, teacher_tokenizer):
     """Require identical token IDs for logit-level distillation."""
     student_vocab = student_tokenizer.get_vocab()
@@ -145,7 +153,6 @@ def dist_setup():
 
 def dist_cleanup():
     if dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 
@@ -538,6 +545,12 @@ def make_chat_dataloader(
         pin_memory=True,
         drop_last=True,
     )
+    if len(loader) == 0:
+        raise ValueError(
+            f"Dataset has {len(dataset)} rows, but at least {batch_size * world_size} are "
+            f"required for one complete distributed batch (per-device batch size {batch_size}, "
+            f"world size {world_size}); reduce the batch size or GPU count, or provide more rows."
+        )
     rank0_print(f"Dataset: {len(dataset)} samples")
     return dataset, sampler, loader
 

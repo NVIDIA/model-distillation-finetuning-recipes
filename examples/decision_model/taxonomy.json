@@ -1,0 +1,9 @@
+{
+  "question": "Which event best describes this financial news headline?",
+  "labels": {
+    "acquisition": "One company buys another company or business.",
+    "partnership": "Companies announce an agreement to work together.",
+    "earnings": "A company reports its financial results.",
+    "other": "The headline describes none of the listed events."
+  }
+}

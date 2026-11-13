@@ -1,0 +1,20 @@
+{"id":"finance-001","messages":[{"role":"user","content":"Example Corp acquired Sample Labs."},{"role":"assistant","content":"[[acquisition]]"}]}
+{"id":"finance-002","messages":[{"role":"user","content":"Example Bank and Sample Pay announced a payments partnership."},{"role":"assistant","content":"[[partnership]]"}]}
+{"id":"finance-003","messages":[{"role":"user","content":"Example Retail reported its quarterly revenue and profit."},{"role":"assistant","content":"[[earnings]]"}]}
+{"id":"finance-004","messages":[{"role":"user","content":"Example Foods opened a new distribution center."},{"role":"assistant","content":"[[other]]"}]}
+{"id":"finance-005","messages":[{"role":"user","content":"Example Software bought Sample Analytics for cash."},{"role":"assistant","content":"[[acquisition]]"}]}
+{"id":"finance-006","messages":[{"role":"user","content":"Example Energy signed an agreement to develop projects with Sample Power."},{"role":"assistant","content":"[[partnership]]"}]}
+{"id":"finance-007","messages":[{"role":"user","content":"Example Manufacturing released its annual financial results."},{"role":"assistant","content":"[[earnings]]"}]}
+{"id":"finance-008","messages":[{"role":"user","content":"Example Logistics appointed a new chief operating officer."},{"role":"assistant","content":"[[other]]"}]}
+{"id":"finance-009","messages":[{"role":"user","content":"Example Holdings completed its purchase of Sample Services."},{"role":"assistant","content":"[[acquisition]]"}]}
+{"id":"finance-010","messages":[{"role":"user","content":"Example Devices and Sample Networks agreed to jointly develop network equipment."},{"role":"assistant","content":"[[partnership]]"}]}
+{"id":"finance-011","messages":[{"role":"user","content":"Example Travel announced a quarterly operating loss."},{"role":"assistant","content":"[[earnings]]"}]}
+{"id":"finance-012","messages":[{"role":"user","content":"Example Health launched a new scheduling application."},{"role":"assistant","content":"[[other]]"}]}
+{"id":"finance-013","messages":[{"role":"user","content":"Example Media purchased Sample Studios and its production business."},{"role":"assistant","content":"[[acquisition]]"}]}
+{"id":"finance-014","messages":[{"role":"user","content":"Example Markets formed a distribution partnership with Sample Goods."},{"role":"assistant","content":"[[partnership]]"}]}
+{"id":"finance-015","messages":[{"role":"user","content":"Example Telecom reported higher annual earnings."},{"role":"assistant","content":"[[earnings]]"}]}
+{"id":"finance-016","messages":[{"role":"user","content":"Example Utilities scheduled maintenance at one of its facilities."},{"role":"assistant","content":"[[other]]"}]}
+{"id":"finance-017","messages":[{"role":"user","content":"Example Industries acquired the packaging division of Sample Group."},{"role":"assistant","content":"[[acquisition]]"}]}
+{"id":"finance-018","messages":[{"role":"user","content":"Example Cloud and Sample Security announced a joint product-development agreement."},{"role":"assistant","content":"[[partnership]]"}]}
+{"id":"finance-019","messages":[{"role":"user","content":"Example Packaging published its half-year sales and net income."},{"role":"assistant","content":"[[earnings]]"}]}
+{"id":"finance-020","messages":[{"role":"user","content":"Example Transit moved its headquarters to a new office."},{"role":"assistant","content":"[[other]]"}]}

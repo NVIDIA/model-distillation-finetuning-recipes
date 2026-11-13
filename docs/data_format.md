@@ -1,5 +1,8 @@
 # Data format
 
+This page describes the causal language model recipes. See the
+[decision model recipe](decision_model_finetuning.md) for decision rows and taxonomy.
+
 ## Training records
 
 Training input is UTF-8 JSON Lines (JSONL): one complete JSON object per line,
@@ -35,7 +38,7 @@ the optimized tokens and must be recorded with a run.
 Run the dataloader verifier before training:
 
 ```bash
-python scripts/verify_fsdp2_dataloader.py \
+python -m scripts.causal_lm.verify_dataloader \
   --tokenizer /models/base \
   --data /data/train.jsonl \
   --chat_template configs/chat_template_qwen3_generation.jinja
@@ -47,8 +50,8 @@ Both markers must each encode to one dedicated token. Do not enable
 
 ## Data responsibility
 
-This repository does not provide training datasets. Dataset owners and
-operators are responsible for:
+The included decision-model examples are synthetic; supply your own dataset
+for fine-tuning. Dataset owners and operators are responsible for:
 
 - confirming collection, privacy, consent, export-control, and license terms;
 - checking that model and tokenizer licenses permit use with the data;
