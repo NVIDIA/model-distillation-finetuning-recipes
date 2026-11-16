@@ -56,6 +56,21 @@ publication commits must also carry the Developer Certificate of Origin
 sign-off required by `CONTRIBUTING.md`. This authorship attestation remains
 subject to NVIDIA Open Source approval.
 
+## Decision model recipe
+
+The shared helper moved from `scripts/fsdp2_common.py` to
+`scripts/shared/fsdp2_common.py`. Local review also tightened CLI validation,
+small-dataset handling, and distributed cleanup. The decision model additions
+reuse it and add fine-tuning, data conversion/splitting,
+checkpoint validation, and evaluation scripts under `scripts/decision_model/`.
+Prompt examples and tests use synthetic fixtures. Model checkpoints, tokenizers,
+model code, and serving prompt modules are supplied by the user.
+
+On 2026-11-10, repository owner Dhruv Desai confirmed that he and Lavinia
+Ghita authored the new decision model recipe as original NVIDIA work, with no
+copied or adapted code from other projects. He also confirmed release coverage
+for these additions.
+
 ## Dependencies and containers
 
 `NOTICE.md` lists direct dependencies but is not a container software bill of

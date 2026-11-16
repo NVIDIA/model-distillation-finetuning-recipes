@@ -3,9 +3,9 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "model-distillation-recipes"
+name = "model-distillation-finetuning-recipes"
 version = "0.1.0"
-description = "Reference PyTorch recipes for LoRA fine-tuning and knowledge distillation with FSDP2"
+description = "Reference PyTorch FSDP2 recipes for LoRA, distillation, and decision-model fine-tuning"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -27,7 +27,8 @@ runtime = [
     "accelerate==1.15.0",
     "datasets==5.0.1",
     "peft==0.21.0",
-    "torch>=2.4",
+    "safetensors==0.8.0",
+    "torch>=2.6",
     "transformers>=5.6.0",
 ]
 dev = [
@@ -36,7 +37,8 @@ dev = [
     "peft==0.21.0",
     "pytest>=7",
     "ruff",
-    "torch>=2.4",
+    "safetensors==0.8.0",
+    "torch>=2.6",
     "transformers>=5.6.0",
 ]
 logging = [
@@ -58,7 +60,7 @@ py-modules = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "gpu: requires one or more CUDA-capable GPUs",
+    "gpu: requires one or more NVIDIA GPUs",
     "distributed: launches or requires multiple processes",
     "slow: takes substantially longer than the default CPU suite",
     "requires_model: requires model weights or tokenizer assets",
@@ -70,3 +72,12 @@ line-length = 100
 
 [tool.ruff.format]
 quote-style = "preserve"
+
+[tool.ruff.lint.per-file-ignores]
+# Preserve the validators' consistent ValueError contract for malformed inputs.
+"scripts/decision_model/convert_chat.py" = ["TRY004"]
+"scripts/decision_model/runtime.py" = ["TRY004"]
+"scripts/decision_model/evaluate.py" = ["TRY004"]
+"scripts/decision_model/score.py" = ["TRY004"]
+"scripts/decision_model/split_data.py" = ["TRY004"]
+"scripts/decision_model/validate_checkpoint.py" = ["TRY004"]

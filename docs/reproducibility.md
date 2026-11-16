@@ -15,7 +15,7 @@ Capture the following in a durable run manifest outside the source tree:
 - immutable base and final container image digests;
 - GPU model, GPU count, node count, driver, CUDA, NCCL, and network settings;
 - model and tokenizer identifiers, immutable revisions, and local checksums;
-- chat-template checksum and supported `model_type` (`qwen3` or `nemotron_h`);
+- chat-template or decision-prompt-module checksum and the model's `model_type`;
 - dataset checksums plus documented preprocessing and split;
 - seed, sequence length, global/micro batch sizes, accumulation, optimizer,
   schedule, precision, attention backend, and all loss settings; and
@@ -44,6 +44,9 @@ environment:
 
 For a release candidate, smoke-test LoRA and distillation on both supported
 model types, checkpoint/resume, final export, and multi-node launch.
+Also validate LoRA and full decision-model fine-tuning, stratified three-way
+splits, resume, export/reload, and final test evaluation as described in the
+[GPU checklist](gpu_validation.md#9-decision-model-recipe).
 Compare losses and metrics with tolerances appropriate to bfloat16 and the
 selected kernels; bitwise identity is not generally expected across hardware
 or software stacks.

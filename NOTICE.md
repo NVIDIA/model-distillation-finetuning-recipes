@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-Model Distillation Recipes does not intentionally vendor third-party library
-source code. One compatibility template contains adapted third-party material
-as documented below.
+Model Distillation and Fine-Tuning Recipes does not intentionally vendor
+third-party library source code. One compatibility template contains adapted
+third-party material as documented below.
 
 ## Adapted Qwen3 Chat Template
 
@@ -22,6 +22,7 @@ separately under their respective licenses:
 - [`accelerate`](https://github.com/huggingface/accelerate) — Apache-2.0.
 - [`datasets`](https://github.com/huggingface/datasets) — Apache-2.0.
 - [`peft`](https://github.com/huggingface/peft) — Apache-2.0.
+- [`safetensors`](https://github.com/huggingface/safetensors) — Apache-2.0.
 - [`torch`](https://github.com/pytorch/pytorch) — BSD-3-Clause for the PyTorch
   project; distributions include third-party components under additional
   licenses.

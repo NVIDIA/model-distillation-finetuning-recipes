@@ -23,7 +23,7 @@ Saves the LoRA adapter in PEFT format.
 Launch with torchrun:
     torchrun --nnodes $NNODES --nproc_per_node 4 \\
         --node_rank $RANK --master_addr $ADDR --master_port 29500 \\
-        lora_fsdp2.py --model_path ... --data_path ...
+        --module scripts.causal_lm.lora_fsdp2 --model_path ... --data_path ...
 """
 
 import argparse
@@ -34,7 +34,10 @@ import random
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from fsdp2_common import (
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import AutoModelForCausalLM
+
+from scripts.shared.fsdp2_common import (
     IGNORE_TOKEN_ID,
     build_lambda_weights,
     cosine_lr,
@@ -60,8 +63,6 @@ from fsdp2_common import (
     unit_interval_float,
     validate_resume_step,
 )
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.basicConfig(
@@ -137,7 +138,7 @@ def get_args(argv=None):
         "Unset = plain per-token mean over all assistant tokens.",
     )
 
-    p.add_argument("--max_steps", type=int, required=True)
+    p.add_argument("--max_steps", type=positive_int, required=True)
     p.add_argument("--per_device_train_batch_size", type=int, default=2)
     p.add_argument("--gbs", type=int, default=None)
     p.add_argument("--gradient_accumulation_steps", type=int, default=None)
@@ -152,7 +153,7 @@ def get_args(argv=None):
 
     p.add_argument("--save_steps", type=positive_int, default=None)
     p.add_argument("--dcp_resume_path", type=str, default=None)
-    p.add_argument("--logging_steps", type=int, default=10)
+    p.add_argument("--logging_steps", type=positive_int, default=10)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)

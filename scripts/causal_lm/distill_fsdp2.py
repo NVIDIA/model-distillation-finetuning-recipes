@@ -24,7 +24,7 @@ weighting for merged data.
 Launch with torchrun:
     torchrun --nnodes $NNODES --nproc_per_node 4 \\
         --node_rank $RANK --master_addr $ADDR --master_port 29500 \\
-        distill_fsdp2.py --student_path ... --teacher_path ... --data_path ...
+        --module scripts.causal_lm.distill_fsdp2 --student_path ... --teacher_path ... --data_path ...
 """
 
 import argparse
@@ -34,7 +34,9 @@ import random
 
 import torch
 import torch.nn.functional as F
-from fsdp2_common import (
+from transformers import AutoModelForCausalLM
+
+from scripts.shared.fsdp2_common import (
     IGNORE_TOKEN_ID,
     build_lambda_weights,
     cosine_lr,
@@ -48,6 +50,7 @@ from fsdp2_common import (
     make_chat_dataloader,
     masked_mean,
     next_batch,
+    positive_float,
     positive_int,
     rank0_print,
     reduce_mean_scalar,
@@ -63,7 +66,6 @@ from fsdp2_common import (
     validate_tokenizer_compatibility,
     weighted_reduce,
 )
-from transformers import AutoModelForCausalLM
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.basicConfig(
@@ -111,7 +113,7 @@ def get_args(argv=None):
     p.add_argument("--max_samples", type=int, default=None)
 
     # KD
-    p.add_argument("--kd_temperature", type=float, default=1.0)
+    p.add_argument("--kd_temperature", type=positive_float, default=1.0)
     p.add_argument("--kd_loss_scale", type=float, default=1.0)
     p.add_argument(
         "--use_lm_loss",
@@ -131,7 +133,7 @@ def get_args(argv=None):
     )
 
     # Training
-    p.add_argument("--max_steps", type=int, required=True)
+    p.add_argument("--max_steps", type=positive_int, required=True)
     p.add_argument("--per_device_train_batch_size", type=int, default=2)
     p.add_argument("--gbs", type=int, default=None, help="Global batch size")
     p.add_argument("--gradient_accumulation_steps", type=int, default=None)
@@ -150,7 +152,7 @@ def get_args(argv=None):
     p.add_argument("--dcp_resume_path", type=str, default=None)
 
     # Logging
-    p.add_argument("--logging_steps", type=int, default=10)
+    p.add_argument("--logging_steps", type=positive_int, default=10)
     p.add_argument("--wandb_project", type=str, default=None)
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_name", type=str, default=None)

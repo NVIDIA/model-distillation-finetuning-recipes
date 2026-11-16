@@ -1,6 +1,6 @@
 # Governance
 
-Model Distillation Recipes uses a maintainer-led governance model.
+Model Distillation and Fine-Tuning Recipes uses a maintainer-led governance model.
 
 ## Maintainers
 

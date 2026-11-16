@@ -1,14 +1,17 @@
 # Distributed execution
 
-The training recipes use raw `torch.distributed` and composable FSDP2
+The causal language model recipes use raw `torch.distributed` and composable FSDP2
 (`torch.distributed.fsdp.fully_shard`). Launch exactly one process per GPU with
 `torchrun`; the scripts read `RANK`, `LOCAL_RANK`, and `WORLD_SIZE`, select the
 local CUDA device, and initialize NCCL.
 
+See the [decision model recipe](decision_model_finetuning.md) for its model
+interface, launch arguments, and checkpoint/resume workflow.
+
 ## Single node
 
 ```bash
-torchrun --standalone --nproc_per_node 4 scripts/lora_fsdp2.py \
+torchrun --standalone --nproc_per_node 4 --module scripts.causal_lm.lora_fsdp2 \
   --model_path /models/base \
   --data_path /data/train.jsonl \
   --output_dir /outputs/lora \
@@ -16,7 +19,7 @@ torchrun --standalone --nproc_per_node 4 scripts/lora_fsdp2.py \
   --max_steps 500
 ```
 
-Use the same launch shape for `scripts/distill_fsdp2.py`, supplying both
+Use the same launch shape for `scripts.causal_lm.distill_fsdp2`, supplying both
 `--student_path` and `--teacher_path`.
 
 ## Multiple nodes
@@ -32,7 +35,7 @@ torchrun \
   --rdzv_backend c10d \
   --rdzv_endpoint "${MASTER_ADDR}:${MASTER_PORT}" \
   --rdzv_id "${RUN_ID}" \
-  scripts/distill_fsdp2.py ...
+  --module scripts.causal_lm.distill_fsdp2 ...
 ```
 
 The process manager or scheduler used at a deployment site must provide these

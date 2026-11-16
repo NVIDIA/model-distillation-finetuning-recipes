@@ -11,7 +11,7 @@ def test_dockerfile_uses_public_pytorch_base():
     assert "ARG NGC_BASE_IMAGE=nvcr.io/nvidia/pytorch:" in dockerfile
     assert "FROM ${NGC_BASE_IMAGE}" in dockerfile
     assert "ARG INSTALL_MAMBA_KERNELS=0" in dockerfile
-    assert "WORKDIR /workspace/model-distillation-recipes" in dockerfile
+    assert "WORKDIR /workspace/model-distillation-finetuning-recipes" in dockerfile
 
 
 def test_repository_has_no_registry_push_helper():

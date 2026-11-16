@@ -1,9 +1,9 @@
-# Model Distillation Recipes
+# Model Distillation and Fine-Tuning Recipes
 
-Reference PyTorch recipes for LoRA supervised fine-tuning and logit-based
-knowledge distillation with FSDP2. The code is intentionally compact:
-Hugging Face models, PEFT adapters, `torch.distributed`, and explicit training
-loops without a trainer framework.
+Reference PyTorch recipes for LoRA supervised fine-tuning, logit-based
+knowledge distillation, and decision-model fine-tuning with FSDP2. The code is
+intentionally compact: Hugging Face models, PEFT adapters, `torch.distributed`,
+and explicit training loops without a trainer framework.
 
 This is research software. It requires NVIDIA GPUs for training and does not
 provide production deployment guarantees or pretrained model weights.
@@ -12,20 +12,22 @@ provide production deployment guarantees or pretrained model weights.
 
 - Qwen3 (`model_type=qwen3`) and NemotronH-family
   (`model_type=nemotron_h`) causal language models.
+- Compatible user-supplied decision models through the
+  [decision model recipe](docs/decision_model_finetuning.md).
 - Assistant-only loss masking through model-specific Jinja chat templates.
-- LoRA cross-entropy training.
+- LoRA cross-entropy fine-tuning.
 - Teacher/student KL distillation, optionally combined with language-model
   cross-entropy.
 - Direct single-node and multi-node `torchrun` launch paths.
 
-Other architectures fail early until their FSDP2 layer class and LoRA target
-modules are explicitly supported.
+For the causal language model recipes, other architectures fail early until
+their FSDP2 layer class and LoRA target modules are explicitly supported.
 
 ## Requirements
 
 - Python 3.10 or newer.
-- PyTorch with FSDP2 support.
-- CUDA-capable NVIDIA GPUs for training.
+- PyTorch 2.6 or newer with FSDP2 support.
+- NVIDIA GPUs.
 - A model, tokenizer, and dataset whose licenses permit your intended use.
 
 Install the core development environment from the repository:
@@ -41,9 +43,19 @@ experiment logging and NemotronH fused kernels. The supplied container is the
 recommended GPU environment because it starts from a matched NGC PyTorch and
 CUDA stack.
 
+Run the commands below from the repository root. Scripts are grouped by workflow:
+
+```text
+scripts/
+  causal_lm/       # LoRA, distillation, and dataloader checks
+  decision_model/  # Data preparation, fine-tuning, evaluation, and scoring
+  shared/          # FSDP2, scheduling, and checkpoint helpers
+```
+
 ## Data and templates
 
-Training data is JSONL with one `messages` array per line:
+For the causal language model recipes, data is JSONL with one `messages` array
+per line:
 
 ```json
 {"messages":[{"role":"user","content":"Question"},{"role":"assistant","content":"Answer"}]}
@@ -65,7 +77,7 @@ samples with empty assistant masks are rejected before training.
 Inspect a tokenizer/dataset pair before a GPU run:
 
 ```bash
-python scripts/verify_fsdp2_dataloader.py \
+python -m scripts.causal_lm.verify_dataloader \
   --tokenizer /path/to/model \
   --data /path/to/train.jsonl \
   --chat_template configs/chat_template_qwen3_generation.jinja \
@@ -76,12 +88,12 @@ python scripts/verify_fsdp2_dataloader.py \
 Leave it unset for tokenizers such as Nemotron Nano 9B that do not provide
 dedicated marker tokens.
 
-## LoRA training
+## LoRA fine-tuning
 
 Launch one process per GPU with `torchrun`:
 
 ```bash
-torchrun --standalone --nproc_per_node 4 scripts/lora_fsdp2.py \
+torchrun --standalone --nproc_per_node 4 --module scripts.causal_lm.lora_fsdp2 \
   --model_path /path/to/model \
   --data_path /path/to/train.jsonl \
   --output_dir /path/to/lora-output \
@@ -103,7 +115,7 @@ loss = W * mean(answer_loss) + (1 - W) * mean(reasoning_loss)
 ## Knowledge distillation
 
 ```bash
-torchrun --standalone --nproc_per_node 4 scripts/distill_fsdp2.py \
+torchrun --standalone --nproc_per_node 4 --module scripts.causal_lm.distill_fsdp2 \
   --student_path /path/to/student \
   --teacher_path /path/to/teacher \
   --data_path /path/to/train.jsonl \
@@ -124,17 +136,24 @@ part of this recipe. Student and teacher tokenizers must have identical
 token-to-ID vocabularies, and both models must expose the same output vocabulary
 size; the script validates these requirements before sharding.
 
+## Decision model fine-tuning
+
+Fine-tune a compatible user-supplied decision model with LoRA or full decoder
+updates. Supply its checkpoint, tokenizer, model code, and prompt module.
+See the [recipe](docs/decision_model_finetuning.md) for setup,
+train/validation/test splits, checkpoint selection, and evaluation.
+
 ## Container
 
 Build a local image:
 
 ```bash
 docker build \
-  --tag model-distillation-recipes:local \
+  --tag model-distillation-finetuning-recipes:local \
   docker/
 ```
 
-The Dockerfile uses the public `nvcr.io/nvidia/pytorch:26.07-py3` base. NGC access
+The Dockerfile uses the public `nvcr.io/nvidia/pytorch:26.10-py3` base. NGC access
 may require accepting NVIDIA's registry terms and authenticating to `nvcr.io`.
 NemotronH fused kernels are opt-in because they compile on the target
 architecture:
@@ -142,7 +161,7 @@ architecture:
 ```bash
 docker build \
   --build-arg INSTALL_MAMBA_KERNELS=1 \
-  --tag model-distillation-recipes:mamba \
+  --tag model-distillation-finetuning-recipes:mamba \
   docker/
 ```
 
@@ -154,11 +173,11 @@ Mount the repository and runtime data when starting the container:
 ```bash
 docker run --rm -it --gpus all \
   --ipc=host \
-  --volume "$PWD:/workspace/model-distillation-recipes" \
+  --volume "$PWD:/workspace/model-distillation-finetuning-recipes" \
   --volume "/path/to/models:/models:ro" \
   --volume "/path/to/data:/data:ro" \
   --volume "/path/to/outputs:/outputs" \
-  model-distillation-recipes:local
+  model-distillation-finetuning-recipes:local
 ```
 
 Model arguments may be mounted local paths or Hugging Face model IDs. Use
@@ -178,6 +197,7 @@ gates. See [docs/reproducibility.md](docs/reproducibility.md).
 
 ## Project documentation
 
+- [Decision model fine-tuning](docs/decision_model_finetuning.md)
 - [Distributed execution](docs/distributed.md)
 - [GPU validation checklist](docs/gpu_validation.md)
 - [Data format](docs/data_format.md)

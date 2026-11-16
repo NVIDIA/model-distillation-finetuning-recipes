@@ -9,6 +9,8 @@ with the run record.
 Set paths appropriate for the cluster:
 
 ```bash
+set -euo pipefail
+
 export NPROC=4
 export STUDENT_MODEL=/models/student
 export TEACHER_MODEL=/models/teacher
@@ -49,7 +51,7 @@ Expected: all tests pass.
 An exact configuration should start successfully:
 
 ```bash
-torchrun --standalone --nproc_per_node "$NPROC" scripts/lora_fsdp2.py \
+torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.lora_fsdp2 \
   --model_path "$LORA_MODEL" \
   --data_path "$DATA" \
   --output_dir "$OUT/gbs-valid" \
@@ -69,7 +71,7 @@ MBS × NPROC × gradient_accumulation_steps
 A non-divisible global batch size must fail before model loading:
 
 ```bash
-if torchrun --standalone --nproc_per_node "$NPROC" scripts/lora_fsdp2.py \
+if torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.lora_fsdp2 \
   --model_path "$LORA_MODEL" \
   --data_path "$DATA" \
   --output_dir "$OUT/gbs-invalid" \
@@ -86,7 +88,7 @@ fi
 Conflicting batch flags must also fail:
 
 ```bash
-if torchrun --standalone --nproc_per_node "$NPROC" scripts/lora_fsdp2.py \
+if torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.lora_fsdp2 \
   --model_path "$LORA_MODEL" \
   --data_path "$DATA" \
   --output_dir "$OUT/gbs-conflict" \
@@ -106,7 +108,7 @@ fi
 Create a two-step run that writes a checkpoint after completed step 1:
 
 ```bash
-torchrun --standalone --nproc_per_node "$NPROC" scripts/distill_fsdp2.py \
+torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.distill_fsdp2 \
   --student_path "$STUDENT_MODEL" \
   --teacher_path "$TEACHER_MODEL" \
   --data_path "$DATA" \
@@ -125,7 +127,7 @@ test -d "$OUT/distill-initial/dcp/step_1"
 Resume that checkpoint using the original total step target:
 
 ```bash
-torchrun --standalone --nproc_per_node "$NPROC" scripts/distill_fsdp2.py \
+torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.distill_fsdp2 \
   --student_path "$STUDENT_MODEL" \
   --teacher_path "$TEACHER_MODEL" \
   --data_path "$DATA" \
@@ -157,7 +159,7 @@ the dataloader cursor and sampler epoch are not restored.
 Create and resume a LoRA checkpoint with the same two-step pattern:
 
 ```bash
-torchrun --standalone --nproc_per_node "$NPROC" scripts/lora_fsdp2.py \
+torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.lora_fsdp2 \
   --model_path "$LORA_MODEL" \
   --data_path "$DATA" \
   --output_dir "$OUT/lora-initial" \
@@ -171,7 +173,7 @@ torchrun --standalone --nproc_per_node "$NPROC" scripts/lora_fsdp2.py \
 
 test -d "$OUT/lora-initial/dcp/step_1"
 
-torchrun --standalone --nproc_per_node "$NPROC" scripts/lora_fsdp2.py \
+torchrun --standalone --nproc_per_node "$NPROC" --module scripts.causal_lm.lora_fsdp2 \
   --model_path "$LORA_MODEL" \
   --data_path "$DATA" \
   --output_dir "$OUT/lora-resumed" \
@@ -273,3 +275,29 @@ shard-on-read), require all of the following:
 
 Do not mark shard-before-load complete based only on lower RSS. Parameter
 equivalence and end-to-end training/export checks are required.
+
+## 9. Decision model recipe
+
+Use a reviewed, user-supplied checkpoint and prompt module with the
+[decision model recipe](decision_model_finetuning.md). Record the actual image
+digest, source revision/dirty state, topology, and model/data/prompt checksums
+using the run manifest above.
+
+Validate both LoRA and full fine-tuning on the target NVIDIA GPUs:
+
+- Verify that train, validation, and test have the expected per-class counts
+  and disjoint IDs. Use validation for checkpoint selection.
+- Run at least one forward/backward/optimizer update and check finite loss,
+  gradients, and the recorded parameter update.
+- Compare an uninterrupted run with checkpoint/resume using identical inputs,
+  settings, and topology. Check the resumed step, learning rate, data order,
+  and preservation of the best validation checkpoint.
+- Export and reload each checkpoint in a fresh process. Check the manifest,
+  merged LoRA weights, and encoder/shared-readout agreement with recorded
+  numerical tolerances.
+- Compare padded batches against individual unpadded examples. Record peak
+  memory and throughput for both methods at the same batch sizes.
+- Finalize checkpoint choices on validation, then evaluate the untouched test
+  split with complete prediction coverage.
+
+Passing CPU tests does not establish completion of these GPU gates.

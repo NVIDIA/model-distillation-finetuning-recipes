@@ -1,6 +1,6 @@
 # Maintainers
 
-Model Distillation Recipes is maintained by NVIDIA.
+Model Distillation and Fine-Tuning Recipes is maintained by NVIDIA.
 
 Maintainers own technical direction, contribution review, supported
 configurations, releases, and security response. Use repository issues for
