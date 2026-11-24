@@ -418,8 +418,8 @@ python -m scripts.decision_model.evaluate \
 
 With `--packed-read`, the validator also reads the first validation row packed
 and reports its prediction. The evaluator reads each one-question test row as a
-one-question pack, which gives the same probabilities as reading that question
-packed together with others.
+one-question pack: the question gets the same token IDs, positions, and
+attention as when it is packed together with other questions.
 
 ## CPU checks
 
