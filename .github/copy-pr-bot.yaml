@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# copy-pr-bot copies each pull request's head to a `pull-request/<number>` branch, which
+# starts .github/workflows/gpu.yml. PRs from people with write access are copied
+# automatically once ready for review; anyone else's wait for a maintainer to comment
+# `/ok to test <full commit sha>` after reading the change.
+enabled: true
+auto_sync_draft: false
+auto_sync_ready: true
