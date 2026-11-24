@@ -50,6 +50,17 @@ for kind in distill lora; do
   python tests/gpu/checks.py same "$OUT/$kind-rt" "$OUT/$kind-fresh1"
 done
 
+step "Seeds: the same seed repeats the first-step loss, a different seed changes it"
+loss1() { $TR "$@" --max_steps 1 2>&1 | tee /dev/stderr | sed -n 's/.*step 1\/1 | loss \([0-9.]*\).*/\1/p' | tail -1; }
+for kind in distill lora; do
+  [ "$kind" = distill ] && A=$D || A=$L
+  a=$(loss1 $A --output_dir "$OUT/$kind-seed-a")
+  b=$(loss1 $A --output_dir "$OUT/$kind-seed-b")
+  c=$(loss1 $A --output_dir "$OUT/$kind-seed-c" --seed 4321)
+  echo "$kind first-step loss: seed 1234 -> $a, $b; seed 4321 -> $c"
+  [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" != "$c" ]
+done
+
 step "Exports reload"
 python tests/gpu/checks.py reload-full "$OUT/distill-resumed" "$STUDENT"
 python tests/gpu/checks.py reload-lora "$OUT/lora-resumed" "$STUDENT"
