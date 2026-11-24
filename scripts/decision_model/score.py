@@ -2,7 +2,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Score decision-model probabilities against a labeled reference JSONL file."""
+"""Score decision-model probabilities against a labeled reference JSONL file.
+
+References with several questions per row (reference.targets, from evaluate.py
+--packed-read) are scored per question, with per-row all-correct accuracy.
+"""
 
 from __future__ import annotations
 
@@ -220,14 +224,117 @@ def score_target(
     }
 
 
+def has_question_targets(references: list[dict[str, Any]]) -> bool:
+    """True when any reference row holds per-question targets."""
+    return any(
+        isinstance(row.get("reference"), dict) and "targets" in row["reference"]
+        for row in references
+    )
+
+
+def question_targets(reference: dict[str, Any]) -> dict[str, str]:
+    """Targets by question key: reference.targets, or the one question's target."""
+    section = reference.get("reference")
+    targets = section.get("targets") if isinstance(section, dict) else None
+    if targets is None:
+        payload = reference.get("input")
+        questions = payload.get("questions") if isinstance(payload, dict) else None
+        if not isinstance(questions, dict) or len(questions) != 1:
+            raise ValueError(f"reference {reference.get('id')!r} lacks reference.targets")
+        return {next(iter(questions)): target_of(reference)}
+    if (
+        not isinstance(targets, dict)
+        or not targets
+        or any(not isinstance(value, str) for value in targets.values())
+    ):
+        raise ValueError(f"reference {reference.get('id')!r} has invalid reference.targets")
+    return targets
+
+
+def score_questions(
+    references: list[dict[str, Any]],
+    predictions_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Per-question metrics and per-row all-correct accuracy."""
+    records = []
+    rows_correct = []
+    missing_ids = []
+    for reference in references:
+        row_id = reference["id"]
+        targets = question_targets(reference)
+        prediction = predictions_by_id.get(row_id)
+        if prediction is None:
+            missing_ids.append(row_id)
+            continue
+        if "questions" in prediction:
+            answers = prediction["questions"]
+            if not isinstance(answers, dict) or set(answers) != set(targets):
+                raise ValueError(f"prediction {row_id!r} questions do not match reference.targets")
+        elif len(targets) == 1:
+            answers = {next(iter(targets)): prediction}
+        else:
+            raise ValueError(f"prediction {row_id!r} lacks per-question answers")
+        row_records = []
+        for key, target in targets.items():
+            answer = answers[key]
+            if not isinstance(answer, dict) or not isinstance(answer.get("probs"), dict):
+                raise ValueError(f"prediction {row_id!r} question {key!r} has no probabilities")
+            labels = list(answer["probs"])
+            if target not in labels and target.lower() in labels:
+                target = target.lower()
+            if target not in labels:
+                raise ValueError(f"reference {row_id!r} question {key!r} target {target!r} unknown")
+            probabilities = normalized_probabilities({**answer, "id": row_id}, labels)
+            predicted = answer.get("pred", max(labels, key=probabilities.__getitem__))
+            if predicted not in labels or probabilities[predicted] != max(probabilities.values()):
+                raise ValueError(
+                    f"prediction {row_id!r} question {key!r} pred must be a maximum-probability label"
+                )
+            row_records.append(
+                {
+                    "key": key,
+                    "correct": predicted == target,
+                    "p_target": probabilities[target],
+                    "brier": sum(
+                        (probabilities[label] - float(label == target)) ** 2 for label in labels
+                    ),
+                }
+            )
+        records.extend(row_records)
+        rows_correct.append(all(record["correct"] for record in row_records))
+    if not records:
+        raise ValueError("no predictions matched the references")
+    total = len(records)
+    per_key: dict[str, dict[str, Any]] = {}
+    for key in dict.fromkeys(record["key"] for record in records):
+        key_records = [record for record in records if record["key"] == key]
+        per_key[key] = {
+            "questions": len(key_records),
+            "accuracy": sum(record["correct"] for record in key_records) / len(key_records),
+        }
+    return {
+        "expected_rows": len(references),
+        "scored_rows": len(rows_correct),
+        "missing_predictions": len(missing_ids),
+        "missing_prediction_ids": missing_ids[:100],
+        "scored_questions": total,
+        "accuracy": sum(record["correct"] for record in records) / total,
+        "row_all_correct": sum(rows_correct) / len(rows_correct),
+        "log_loss": sum(-math.log(max(1e-12, record["p_target"])) for record in records) / total,
+        "brier": sum(record["brier"] for record in records) / total,
+        "per_question_key": per_key,
+    }
+
+
 def score_all(
     references: list[dict[str, Any]],
     predictions: list[dict[str, Any]],
-    labels: list[str],
+    labels: list[str] | None,
     *,
     allow_partial: bool = False,
 ) -> dict[str, Any]:
-    if (
+    question_mode = has_question_targets(references)
+    if not question_mode and (
         not isinstance(labels, list)
         or len(labels) < 2
         or any(not isinstance(label, str) or not label.strip() for label in labels)
@@ -242,8 +349,12 @@ def score_all(
     missing = set(references_by_id) - set(predictions_by_id)
     if missing and not allow_partial:
         raise ValueError(f"missing predictions for {len(missing)} reference rows")
-    metrics = score_target(references, predictions_by_id, labels)
-    return {
+    metrics = (
+        score_questions(references, predictions_by_id)
+        if question_mode
+        else score_target(references, predictions_by_id, labels)
+    )
+    result = {
         "reference_rows": len(references),
         "prediction_rows": len(predictions),
         "extra_predictions": len(extra_predictions),
@@ -251,15 +362,73 @@ def score_all(
         "allow_partial": allow_partial,
         "metrics": metrics,
     }
+    if question_mode:
+        result["scoring"] = "per question"
+    return result
 
 
 def percent(value: float) -> str:
     return f"{100 * value:.2f}%"
 
 
+def run_markdown_lines(run: dict[str, Any]) -> list[str]:
+    if not run:
+        return []
+    return [
+        "",
+        "## Run provenance",
+        "",
+        f"- Model checkpoint: `{run.get('checkpoint', 'unknown')}`",
+        f"- Model SHA-256: `{run.get('model_sha256', 'unknown')}`",
+        f"- Prompt module SHA-256: `{run.get('prompt_module_sha256', 'unknown')}`",
+        f"- Input SHA-256: `{run.get('input_sha256', 'unknown')}`",
+        f"- GPUs: {', '.join(run.get('gpus', []))}",
+        f"- Elapsed: {run.get('elapsed_seconds', 0):.2f} seconds",
+        f"- Throughput: {run.get('throughput_rows_per_second', 0):.2f} rows/second",
+        f"- Evaluator failures: {run.get('evaluator_failures', 0)}",
+    ]
+
+
+def question_markdown_lines(metrics: dict[str, Any]) -> list[str]:
+    lines = [
+        (
+            f"- Question accuracy: **{percent(metrics['accuracy'])}** "
+            f"({metrics['scored_questions']} questions)"
+        ),
+        f"- Rows with every question correct: **{percent(metrics['row_all_correct'])}**",
+        f"- Log loss: {metrics['log_loss']:.4f}",
+        f"- Multiclass Brier score: {metrics['brier']:.4f}",
+        (
+            f"- Coverage: {metrics['scored_rows']}/{metrics['expected_rows']} rows "
+            f"({metrics['missing_predictions']} missing)"
+        ),
+        "",
+        "## Accuracy by question key",
+        "",
+    ]
+    for key, key_metrics in metrics["per_question_key"].items():
+        lines.append(
+            f"- {key}: {percent(key_metrics['accuracy'])} ({key_metrics['questions']} questions)"
+        )
+    return lines
+
+
 def markdown_report(result: dict[str, Any]) -> str:
     metrics = result["metrics"]
     run = result.get("run", {})
+    if result.get("scoring") == "per question":
+        lines = [
+            "# Decision model evaluation",
+            "",
+            f"Evaluation target: {result.get('target', 'reference labels')}, per question.",
+            "",
+            "## Results",
+            "",
+            *question_markdown_lines(metrics),
+        ]
+        lines.extend(run_markdown_lines(run))
+        lines.append("")
+        return "\n".join(lines)
     weakest = sorted(
         (
             (label, class_metrics)
@@ -295,22 +464,7 @@ def markdown_report(result: dict[str, Any]) -> str:
             f"- {label}: {percent(metrics['recall'])} recall "
             f"({metrics['correct']}/{metrics['support']})"
         )
-    if run:
-        lines.extend(
-            [
-                "",
-                "## Run provenance",
-                "",
-                f"- Model checkpoint: `{run.get('checkpoint', 'unknown')}`",
-                f"- Model SHA-256: `{run.get('model_sha256', 'unknown')}`",
-                f"- Prompt module SHA-256: `{run.get('prompt_module_sha256', 'unknown')}`",
-                f"- Input SHA-256: `{run.get('input_sha256', 'unknown')}`",
-                f"- GPUs: {', '.join(run.get('gpus', []))}",
-                f"- Elapsed: {run.get('elapsed_seconds', 0):.2f} seconds",
-                f"- Throughput: {run.get('throughput_rows_per_second', 0):.2f} rows/second",
-                f"- Evaluator failures: {run.get('evaluator_failures', 0)}",
-            ]
-        )
+    lines.extend(run_markdown_lines(run))
     lines.append("")
     return "\n".join(lines)
 
@@ -347,7 +501,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--taxonomy",
         type=Path,
-        required=True,
+        help="Required unless references hold per-question reference.targets",
     )
     parser.add_argument("--run-metadata", type=Path)
     parser.add_argument("--target-name", default="reference labels")
@@ -356,7 +510,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output-markdown", type=Path, required=True)
     args = parser.parse_args(argv)
     outputs = [args.output_json.resolve(), args.output_markdown.resolve()]
-    inputs = {args.references.resolve(), args.predictions.resolve(), args.taxonomy.resolve()}
+    inputs = {args.references.resolve(), args.predictions.resolve()}
+    if args.taxonomy:
+        inputs.add(args.taxonomy.resolve())
     if args.run_metadata:
         inputs.add(args.run_metadata.resolve())
     if outputs[0] == outputs[1] or inputs.intersection(outputs):
@@ -364,15 +520,20 @@ def main(argv: list[str] | None = None) -> None:
 
     references = read_jsonl(args.references)
     predictions = read_jsonl(args.predictions)
-    taxonomy = json.loads(args.taxonomy.read_text())
-    if not isinstance(taxonomy, dict) or not isinstance(taxonomy.get("labels"), dict):
-        raise ValueError("taxonomy must be an object containing a labels mapping")
-    labels = list(taxonomy["labels"])
+    labels = None
+    if args.taxonomy:
+        taxonomy = json.loads(args.taxonomy.read_text())
+        if not isinstance(taxonomy, dict) or not isinstance(taxonomy.get("labels"), dict):
+            raise ValueError("taxonomy must be an object containing a labels mapping")
+        labels = list(taxonomy["labels"])
+    elif not has_question_targets(references):
+        parser.error("--taxonomy is required for one-question references")
     result = score_all(references, predictions, labels, allow_partial=args.allow_partial)
     result["target"] = args.target_name
     result["references"] = str(args.references.resolve())
     result["predictions"] = str(args.predictions.resolve())
-    result["taxonomy"] = str(args.taxonomy.resolve())
+    if args.taxonomy:
+        result["taxonomy"] = str(args.taxonomy.resolve())
     if args.run_metadata:
         full_run = json.loads(args.run_metadata.read_text())
         if not isinstance(full_run, dict):

@@ -207,7 +207,8 @@ class DecisionRows:
         if not isinstance(reference, dict):
             raise ValueError("Decision row lacks reference")
         soft = row.get("soft_labels")
-        if len(questions) == 1 and "target" in reference:
+        multi = not (len(questions) == 1 and "target" in reference)
+        if not multi:
             targets = {next(iter(questions)): reference["target"]}
             softs = {next(iter(questions)): soft}
         else:
@@ -247,7 +248,7 @@ class DecisionRows:
         packed_questions = []
         for example in examples:
             packed_questions.append(dict(example, ids=example["ids"][state_length:]))
-        packed = {"packed": True, "state": state, "questions": packed_questions}
+        packed = {"packed": True, "multi": multi, "state": state, "questions": packed_questions}
         if packed_length(packed) > self.max_tokens:
             return None
         return packed

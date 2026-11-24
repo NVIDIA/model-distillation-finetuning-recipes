@@ -417,9 +417,33 @@ python -m scripts.decision_model.evaluate \
 ```
 
 With `--packed-read`, the validator also reads the first validation row packed
-and reports its prediction. The evaluator reads each one-question test row as a
-one-question pack: the question gets the same token IDs, positions, and
-attention as when it is packed together with other questions.
+and reports its prediction for every question.
+
+### Evaluate several questions per state
+
+With `--packed-read`, test rows may also hold several questions about one state.
+The evaluator reads each row once, in one packed sequence, and writes one
+prediction per question. One-question rows keep the one-answer-per-row record:
+
+```jsonl
+{"id":"news-007","questions":{"event":{"probs":{"acquisition":0.97,"other":0.03},"pred":"acquisition"},"sector":{"probs":{"technology":0.88,"finance":0.12},"pred":"technology"}}}
+{"id":"news-008","probs":{"acquisition":0.04,"partnership":0.91,"earnings":0.02,"other":0.03},"pred":"partnership"}
+```
+
+Each question gets the same token IDs, positions, and attention as in a
+one-question pack of the same state. When the references hold
+`reference.targets`, the scorer reports accuracy, log loss, and Brier score per
+question, accuracy by question key, and the share of rows with every question
+correct. `--taxonomy` is optional for these references:
+
+```bash
+python -m scripts.decision_model.score \
+  --references "$TEST_JSONL" \
+  --predictions "$RESULTS_ROOT/lora-packed-test/predictions.jsonl" \
+  --run-metadata "$RESULTS_ROOT/lora-packed-test/run.json" \
+  --output-json "$RESULTS_ROOT/lora-packed-test/score.json" \
+  --output-markdown "$RESULTS_ROOT/lora-packed-test/score.md"
+```
 
 ## CPU checks
 

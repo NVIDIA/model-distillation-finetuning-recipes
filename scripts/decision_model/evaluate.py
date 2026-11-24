@@ -119,6 +119,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def option_prediction(labels: list[str], probabilities: list[float]) -> dict[str, Any]:
+    """Probability mapping and maximum-probability label of one question."""
+    if len(probabilities) != len(labels) or not all(
+        math.isfinite(value) for value in probabilities
+    ):
+        raise ValueError("model produced invalid option probabilities")
+    return {
+        "probs": dict(zip(labels, probabilities, strict=True)),
+        "pred": labels[max(range(len(labels)), key=probabilities.__getitem__)],
+    }
+
+
+def predict_row(row_id: str, example: dict, scorer, *, mask_id: int, device) -> dict[str, Any]:
+    """Prediction record of one prepared row.
+
+    One-question rows give {"id", "probs", "pred"}. Packed rows with several
+    questions are read once and give {"id", "questions": {key: {"probs", "pred"}}}.
+    """
+    from scripts.decision_model.runtime import example_option_logits, example_questions
+
+    questions = example_questions(example)
+    logits = example_option_logits([example], scorer, mask_id=mask_id, device=device)[0]
+    answers = [
+        option_prediction(question["labels"], values.softmax(-1).cpu().tolist())
+        for question, values in zip(questions, logits, strict=True)
+    ]
+    if len(questions) == 1 and not example.get("multi"):
+        return {"id": row_id, **answers[0]}
+    return {
+        "id": row_id,
+        "questions": {
+            question["key"]: answer for question, answer in zip(questions, answers, strict=True)
+        },
+    }
+
+
 def run_worker(args: argparse.Namespace) -> None:
     import torch
     from transformers import AutoModel, AutoTokenizer
@@ -127,8 +163,6 @@ def run_worker(args: argparse.Namespace) -> None:
         DecisionRows,
         Scorer,
         enable_bidirectional,
-        example_option_logits,
-        example_questions,
         packed_options,
         resolve_prompt_module,
     )
@@ -163,24 +197,14 @@ def run_worker(args: argparse.Namespace) -> None:
                 example = prepare(row)
                 if example is None:
                     raise ValueError(f"prompt exceeds --max-tokens {args.max_tokens}")
-                questions = example_questions(example)
-                if len(questions) != 1:
-                    raise ValueError("evaluation rows must contain exactly one question")
-                logits = example_option_logits(
-                    [example], scorer, mask_id=int(model.mask_token_id), device=device
-                )[0][0]
-                probabilities = logits.softmax(-1).cpu().tolist()
-                labels = questions[0]["labels"]
-                if len(probabilities) != len(labels) or not all(
-                    math.isfinite(value) for value in probabilities
-                ):
-                    raise ValueError("model produced invalid option probabilities")
                 predictions.append(
-                    {
-                        "id": row["id"],
-                        "probs": dict(zip(labels, probabilities, strict=True)),
-                        "pred": labels[max(range(len(labels)), key=probabilities.__getitem__)],
-                    }
+                    predict_row(
+                        row["id"],
+                        example,
+                        scorer,
+                        mask_id=int(model.mask_token_id),
+                        device=device,
+                    )
                 )
             except Exception as error:
                 if not args.allow_partial:

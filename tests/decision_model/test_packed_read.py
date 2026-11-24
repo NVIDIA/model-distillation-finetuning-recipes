@@ -357,3 +357,135 @@ def test_example_prompt_module_adds_state_end_only_when_configured():
     assert state_end == 101
     assert STATE_END not in plain
     assert [token for token in separated if token != state_end] == plain
+
+
+def test_multi_question_evaluation_equals_each_question_packed_alone(tmp_path):
+    from scripts.decision_model.evaluate import predict_row
+
+    torch.manual_seed(17)
+    scorer = Scorer(GroupDecisionModel()).eval()
+    rows = DecisionRows(tokenizer(), prompt_file(tmp_path), 64, packed_read=True)
+    row = packed_row()
+    multi = predict_row("row", rows(row), scorer, mask_id=MASK, device=torch.device("cpu"))
+
+    assert set(multi) == {"id", "questions"}
+    assert list(multi["questions"]) == ["first", "second", "third"]
+    for key, question_input in row["input"]["questions"].items():
+        alone_row = {
+            "id": key,
+            "input": {"state": "s", "questions": {key: question_input}},
+            "reference": {"target": row["reference"]["targets"][key]},
+        }
+        alone = predict_row(key, rows(alone_row), scorer, mask_id=MASK, device=torch.device("cpu"))
+        assert set(alone) == {"id", "probs", "pred"}
+        assert alone["pred"] == multi["questions"][key]["pred"]
+        for label, value in alone["probs"].items():
+            assert multi["questions"][key]["probs"][label] == pytest.approx(value, abs=1e-6)
+
+
+def test_single_read_prediction_record_is_unchanged():
+    from scripts.decision_model.evaluate import predict_row
+
+    torch.manual_seed(19)
+    scorer = Scorer(GroupDecisionModel()).eval()
+    example = {"ids": [1, 2, 3], "cand": [10, 11, 12], "labels": ["a", "b", "c"]}
+    record = predict_row("r", example, scorer, mask_id=MASK, device=torch.device("cpu"))
+    logits = batched_option_logits([example], scorer, mask_id=MASK, device=torch.device("cpu"))[0]
+    probabilities = logits.softmax(-1).tolist()
+
+    assert list(record) == ["id", "probs", "pred"]
+    assert record["probs"] == dict(zip(["a", "b", "c"], probabilities, strict=True))
+    assert record["pred"] == ["a", "b", "c"][max(range(3), key=probabilities.__getitem__)]
+
+
+def question_references():
+    return [
+        {
+            "id": "multi",
+            "input": {"state": "s", "questions": {"event": {}, "deal": {}}},
+            "reference": {"targets": {"event": "acquisition", "deal": "TRUE"}},
+        },
+        {
+            "id": "single",
+            "input": {"state": "s", "questions": {"event": {}}},
+            "reference": {"target": "other"},
+        },
+    ]
+
+
+def question_predictions():
+    return [
+        {
+            "id": "multi",
+            "questions": {
+                "event": {"probs": {"acquisition": 0.75, "other": 0.25}, "pred": "acquisition"},
+                "deal": {"probs": {"false": 0.6, "true": 0.4}, "pred": "false"},
+            },
+        },
+        {"id": "single", "probs": {"acquisition": 0.2, "other": 0.8}, "pred": "other"},
+    ]
+
+
+def test_scoring_counts_each_question_and_rows_with_every_question_correct():
+    from scripts.decision_model.score import score_all
+
+    result = score_all(question_references(), question_predictions(), None)
+    metrics = result["metrics"]
+
+    assert result["scoring"] == "per question"
+    assert metrics["scored_questions"] == 3
+    assert metrics["scored_rows"] == 2
+    assert metrics["accuracy"] == pytest.approx(2 / 3)
+    assert metrics["row_all_correct"] == pytest.approx(1 / 2)
+    assert metrics["log_loss"] == pytest.approx(
+        -(math.log(0.75) + math.log(0.4) + math.log(0.8)) / 3
+    )
+    assert metrics["per_question_key"] == {
+        "event": {"questions": 2, "accuracy": 1.0},
+        "deal": {"questions": 1, "accuracy": 0.0},
+    }
+
+
+def test_question_scoring_requires_an_answer_for_every_target():
+    from scripts.decision_model.score import score_all
+
+    predictions = question_predictions()
+    predictions[0]["questions"].pop("deal")
+    with pytest.raises(ValueError, match="do not match reference.targets"):
+        score_all(question_references(), predictions, None)
+
+
+def test_score_cli_reports_per_question_metrics_without_taxonomy(tmp_path):
+    import json
+
+    from scripts.decision_model.score import main
+
+    references = tmp_path / "references.jsonl"
+    predictions = tmp_path / "predictions.jsonl"
+    references.write_text("".join(json.dumps(row) + "\n" for row in question_references()))
+    predictions.write_text("".join(json.dumps(row) + "\n" for row in question_predictions()))
+    output = tmp_path / "score.json"
+    main(
+        ["--references", str(references), "--predictions", str(predictions)]
+        + ["--output-json", str(output), "--output-markdown", str(tmp_path / "score.md")]
+    )
+    assert json.loads(output.read_text())["metrics"]["row_all_correct"] == 0.5
+    assert "Rows with every question correct: **50.00%**" in (tmp_path / "score.md").read_text()
+    single = tmp_path / "single.jsonl"
+    single.write_text(json.dumps(question_references()[1]) + "\n")
+    with pytest.raises(SystemExit):
+        main(
+            ["--references", str(single), "--predictions", str(predictions)]
+            + ["--output-json", str(output), "--output-markdown", str(tmp_path / "s.md")]
+        )
+
+
+def test_validator_compares_single_read_on_the_first_question():
+    from scripts.decision_model.validate_checkpoint import first_question_row
+
+    row = packed_row()
+    view = first_question_row(row)
+    assert list(view["input"]["questions"]) == ["first"]
+    assert view["reference"] == {"target": "y"}
+    single = {"input": {"questions": {"a": {}}}, "reference": {"target": "x"}}
+    assert first_question_row(single) is single

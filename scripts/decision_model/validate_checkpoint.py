@@ -85,6 +85,22 @@ def verify_receipt(
     return receipt, manifest
 
 
+def first_question_row(row: dict[str, Any]) -> dict[str, Any]:
+    """One-question view of a row: a multi-question row keeps its first question."""
+    reference = row.get("reference") if isinstance(row, dict) else None
+    payload = row.get("input") if isinstance(row, dict) else None
+    targets = reference.get("targets") if isinstance(reference, dict) else None
+    questions = payload.get("questions") if isinstance(payload, dict) else None
+    if not isinstance(targets, dict) or not isinstance(questions, dict) or not questions:
+        return row
+    key = next(iter(questions))
+    return {
+        **row,
+        "input": {**payload, "questions": {key: questions[key]}},
+        "reference": {"target": targets.get(key)},
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -140,7 +156,7 @@ def main(argv: list[str] | None = None) -> None:
     if first_line is None:
         raise ValueError("validation data contains no rows")
     row = json.loads(first_line)
-    example = prepare(row)
+    example = prepare(first_question_row(row) if args.packed_read else row)
     if example is None:
         raise ValueError("first validation prompt exceeds --max-tokens")
     device = torch.device("cuda", 0)
