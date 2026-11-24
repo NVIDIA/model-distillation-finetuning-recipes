@@ -5,9 +5,11 @@
 """Fine-tune decision models with LoRA or full decoder updates using FSDP2.
 
 Fine-tuning optimizes hard- or soft-target cross-entropy over option-code logits
-at a trailing mask token. Full fine-tuning updates encoder layers and the
-final norm while embeddings and the output head stay frozen. LoRA updates
-projection adapters and merges them into the exported Hugging Face checkpoint.
+at a trailing mask token. With --packed-read, each row's questions are read in
+one sequence (state once, then each question with its own mask token). Full
+fine-tuning updates encoder layers and the final norm while embeddings and the
+output head stay frozen. LoRA updates projection adapters and merges them into
+the exported Hugging Face checkpoint.
 """
 
 from __future__ import annotations
@@ -36,9 +38,15 @@ from scripts.decision_model.checkpoint_manifest import (
 from scripts.decision_model.runtime import (
     DecisionRows,
     Scorer,
-    batched_option_logits,
     enable_bidirectional,
+    example_length,
+    example_questions,
+    packed_option_logits,
+    packed_options,
     resolve_prompt_module,
+)
+from scripts.decision_model.runtime import (
+    batched_option_logits as batched_option_logits,  # noqa: PLC0414 -- public re-export
 )
 from scripts.decision_model.runtime import (
     collate_examples as collate_examples,  # noqa: PLC0414 -- public re-export
@@ -91,6 +99,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Top-level model configuration key to omit from exported checkpoints",
     )
     parser.add_argument("--attn-implementation", default="sdpa")
+    parser.add_argument(
+        "--packed-read",
+        action="store_true",
+        help=(
+            "Train state-blind: read each row as [state][question + mask]... where the "
+            "state never attends to a question (requires state_end_token_id in the "
+            "prompt module)"
+        ),
+    )
 
     parser.add_argument("--lr", type=float)
     parser.add_argument("--batch", type=int)
@@ -382,6 +399,17 @@ def row_loss(example: dict, logits: torch.Tensor, kl_weight: float = 0.0) -> tor
     return -(target * log_probs).sum()
 
 
+def example_loss(example: dict, logits: list[torch.Tensor], kl_weight: float = 0.0) -> torch.Tensor:
+    """Row loss: the question loss, or the mean over a packed row's questions."""
+    if not example.get("packed"):
+        return row_loss(example, logits[0], kl_weight)
+    losses = [
+        row_loss(question, question_logits, kl_weight)
+        for question, question_logits in zip(example["questions"], logits, strict=True)
+    ]
+    return torch.stack(losses).mean()
+
+
 def learning_rate(step: int, total: int, peak: float, warmup: float) -> float:
     """Compute linear warmup followed by cosine decay."""
     warm_steps = int(warmup * total)
@@ -460,8 +488,11 @@ def resume_signature(
         if not args.model_revision:
             raise ValueError("Hub checkpoints require --model-revision for reproducible resume")
         model = {"id": args.checkpoint, "revision": args.model_revision}
+    settings = {key: getattr(args, key) for key in keys}
+    if getattr(args, "packed_read", False):
+        settings["packed_read"] = True
     return {
-        "settings": {key: getattr(args, key) for key in keys},
+        "settings": settings,
         "world_size": world,
         "total_steps": total_steps,
         "train_sha256": file_sha256(Path(args.train)),
@@ -816,7 +847,9 @@ def _run(argv: list[str] | None = None) -> None:
         pretrained_kwargs["revision"] = args.model_revision
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, **pretrained_kwargs)
     prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
-    prepare = DecisionRows(tokenizer, prompt_module, args.max_tokens)
+    prepare = DecisionRows(
+        tokenizer, prompt_module, args.max_tokens, **packed_options(args.packed_read)
+    )
     rows = read_jsonl(args.train)
     source_train_rows = len(rows)
     if args.train_limit:
@@ -827,7 +860,7 @@ def _run(argv: list[str] | None = None) -> None:
         example = prepare(row)
         if example is not None:
             usable.append(index)
-            canonical_lengths[index] = len(example["ids"]) + 1
+            canonical_lengths[index] = example_length(example)
     eval_rows = read_jsonl(args.eval) if args.eval else []
     if args.eval_limit:
         eval_rows = eval_rows[: args.eval_limit]
@@ -896,13 +929,14 @@ def _run(argv: list[str] | None = None) -> None:
         weight_decay=args.weight_decay,
     )
 
-    def option_logits(example: dict) -> torch.Tensor:
-        return batched_option_logits(
-            [example],
-            scorer,
-            mask_id=mask_id,
-            device=device,
-        )[0]
+    def question_logits(examples: list[dict]) -> list[list[torch.Tensor]]:
+        if args.packed_read:
+            return packed_option_logits(examples, scorer, mask_id=mask_id, device=device)
+        logits = batched_option_logits(examples, scorer, mask_id=mask_id, device=device)
+        return [[value] for value in logits]
+
+    def option_logits(example: dict) -> list[torch.Tensor]:
+        return question_logits([example])[0]
 
     def validate(step: int) -> dict | None:
         if not validation:
@@ -914,17 +948,20 @@ def _run(argv: list[str] | None = None) -> None:
         with torch.no_grad():
             for index in range(forwards):
                 example = shard[index] if index < len(shard) else validation[0]
-                logits = option_logits(example)
+                per_question = option_logits(example)
                 if index < len(shard):
-                    stats += torch.tensor(
-                        [
-                            float(logits.argmax().item() == example["gold"]),
-                            -logits.log_softmax(-1)[example["gold"]].item(),
-                            1.0,
-                        ],
-                        device=device,
-                        dtype=torch.float64,
-                    )
+                    for question, logits in zip(
+                        example_questions(example), per_question, strict=True
+                    ):
+                        stats += torch.tensor(
+                            [
+                                float(logits.argmax().item() == question["gold"]),
+                                -logits.log_softmax(-1)[question["gold"]].item(),
+                                1.0,
+                            ],
+                            device=device,
+                            dtype=torch.float64,
+                        )
         all_sum(stats)
         scorer.train()
         record = {
@@ -1077,14 +1114,9 @@ def _run(argv: list[str] | None = None) -> None:
             scorer.set_requires_gradient_sync(synchronize)
             if hasattr(scorer, "set_is_last_backward"):
                 scorer.set_is_last_backward(synchronize)
-            logits = batched_option_logits(
-                examples,
-                scorer,
-                mask_id=mask_id,
-                device=device,
-            )
+            logits = question_logits(examples)
             micro_losses = [
-                row_loss(example, example_logits, args.kl_weight)
+                example_loss(example, example_logits, args.kl_weight)
                 for example, example_logits in zip(
                     examples,
                     logits,

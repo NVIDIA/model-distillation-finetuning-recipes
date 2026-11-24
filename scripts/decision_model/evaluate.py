@@ -103,6 +103,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--gpus", default="0", help="comma-separated physical GPU indices")
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument(
+        "--packed-read",
+        action="store_true",
+        help="Read each question in the packed layout (state attends only to the state)",
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.max_tokens < 1:
@@ -121,8 +126,10 @@ def run_worker(args: argparse.Namespace) -> None:
     from scripts.decision_model.runtime import (
         DecisionRows,
         Scorer,
-        batched_option_logits,
         enable_bidirectional,
+        example_option_logits,
+        example_questions,
+        packed_options,
         resolve_prompt_module,
     )
 
@@ -135,7 +142,9 @@ def run_worker(args: argparse.Namespace) -> None:
         pretrained_kwargs["revision"] = args.model_revision
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, **pretrained_kwargs)
     prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
-    prepare = DecisionRows(tokenizer, prompt_module, args.max_tokens)
+    prepare = DecisionRows(
+        tokenizer, prompt_module, args.max_tokens, **packed_options(args.packed_read)
+    )
     model = AutoModel.from_pretrained(
         args.checkpoint,
         dtype=torch.bfloat16,
@@ -154,11 +163,14 @@ def run_worker(args: argparse.Namespace) -> None:
                 example = prepare(row)
                 if example is None:
                     raise ValueError(f"prompt exceeds --max-tokens {args.max_tokens}")
-                logits = batched_option_logits(
+                questions = example_questions(example)
+                if len(questions) != 1:
+                    raise ValueError("evaluation rows must contain exactly one question")
+                logits = example_option_logits(
                     [example], scorer, mask_id=int(model.mask_token_id), device=device
-                )[0]
+                )[0][0]
                 probabilities = logits.softmax(-1).cpu().tolist()
-                labels = example["labels"]
+                labels = questions[0]["labels"]
                 if len(probabilities) != len(labels) or not all(
                     math.isfinite(value) for value in probabilities
                 ):
@@ -244,6 +256,8 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 command.extend(["--model-revision", args.model_revision])
             if args.allow_partial:
                 command.append("--allow-partial")
+            if args.packed_read:
+                command.append("--packed-read")
             environment = os.environ.copy()
             environment["CUDA_VISIBLE_DEVICES"] = gpu
             environment.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -323,6 +337,7 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_module_sha256": prompt_module_sha256,
         "max_tokens": args.max_tokens,
         "attention_implementation": args.attn_implementation,
+        "packed_read": args.packed_read,
         "precision": "bfloat16",
         "gpus": args.gpus,
         "shard_rows": [len(shard) for shard in shards],

@@ -11,6 +11,8 @@ standard library and the tokenizer supplied by the caller.
 import json
 
 OPTION_CODES = ("A", "B", "C", "D")
+# For --packed-read, set this to the state separator used by your model.
+STATE_END_TOKEN = None
 
 
 def candidate_codes(tokenizer):
@@ -24,6 +26,16 @@ def candidate_codes(tokenizer):
     if len({token_id for _, token_id in codes}) != len(codes):
         raise ValueError("Example option codes must have distinct token IDs")
     return codes
+
+
+def state_end_token_id(tokenizer):
+    """Return the single token ID of STATE_END_TOKEN (used by --packed-read)."""
+    if STATE_END_TOKEN is None:
+        raise ValueError("Set STATE_END_TOKEN to a special token to use packed reads")
+    ids = tokenizer.encode(STATE_END_TOKEN, add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(f"State-end token {STATE_END_TOKEN!r} must be one token")
+    return ids[0]
 
 
 def prepare_questions(tokenizer, payload, position_ordering=True, permutation=None):
@@ -57,8 +69,9 @@ def prepare_questions(tokenizer, payload, position_ordering=True, permutation=No
             f"{code}. {label}: {description}"
             for (code, _), (label, description) in zip(codes, options)
         )
+        state_end = STATE_END_TOKEN or ""
         prompt = (
-            f"State:\n{state}\n\nQuestion:\n{question['instructions']}\n\n"
+            f"State:\n{state}{state_end}\n\nQuestion:\n{question['instructions']}\n\n"
             f"Options:\n{option_text}\n\nAnswer:"
         )
         ids = tokenizer.encode(prompt, add_special_tokens=False)

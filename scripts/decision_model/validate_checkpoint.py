@@ -92,6 +92,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--method", choices=("lora", "full"))
     parser.add_argument("--prompt-module", type=Path)
     parser.add_argument("--attn-implementation", default="sdpa")
+    parser.add_argument(
+        "--packed-read",
+        action="store_true",
+        help="Also read the example in the packed layout and report its prediction",
+    )
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--atol", type=float, default=0.02)
     parser.add_argument("--rtol", type=float, default=0.01)
@@ -114,6 +119,7 @@ def main(argv: list[str] | None = None) -> None:
         Scorer,
         batched_option_logits,
         enable_bidirectional,
+        packed_option_logits,
         resolve_prompt_module,
     )
 
@@ -124,6 +130,11 @@ def main(argv: list[str] | None = None) -> None:
     receipt, _ = verify_receipt(args.checkpoint, method=args.method, prompt_module=prompt_module)
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True)
     prepare = DecisionRows(tokenizer, prompt_module, args.max_tokens)
+    packed_prepare = (
+        DecisionRows(tokenizer, prompt_module, args.max_tokens, packed_read=True)
+        if args.packed_read
+        else None
+    )
     with args.data.open() as handle:
         first_line = next((line for line in handle if line.strip()), None)
     if first_line is None:
@@ -168,6 +179,32 @@ def main(argv: list[str] | None = None) -> None:
             msg="standard encoder and shared decision scorer logits differ",
         )
         probabilities = shared_logits.softmax(-1).cpu().tolist()
+        packed = None
+        if packed_prepare is not None:
+            packed_example = packed_prepare(row)
+            if packed_example is None:
+                raise ValueError("first validation prompt exceeds --max-tokens when packed")
+            packed_logits = packed_option_logits(
+                [packed_example],
+                Scorer(model).eval(),
+                mask_id=int(model.mask_token_id),
+                device=device,
+            )[0]
+            packed = []
+            for question, logits in zip(packed_example["questions"], packed_logits, strict=True):
+                values = logits.softmax(-1).cpu().tolist()
+                if not values or not all(math.isfinite(value) for value in values):
+                    raise ValueError("checkpoint produced non-finite packed probabilities")
+                packed.append(
+                    {
+                        "key": question["key"],
+                        "gold": question["labels"][question["gold"]],
+                        "prediction": question["labels"][
+                            max(range(len(values)), key=values.__getitem__)
+                        ],
+                        "probability_sum": sum(values),
+                    }
+                )
     if not probabilities or not all(math.isfinite(value) for value in probabilities):
         raise ValueError("checkpoint produced non-finite probabilities")
     labels = example["labels"]
@@ -184,6 +221,8 @@ def main(argv: list[str] | None = None) -> None:
         "atol": args.atol,
         "rtol": args.rtol,
     }
+    if packed is not None:
+        result["packed_read"] = packed
     print(json.dumps(result, indent=2))
 
 

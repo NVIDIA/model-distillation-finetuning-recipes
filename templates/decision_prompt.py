@@ -6,12 +6,16 @@
 Copy this file to your own decision_prompt.py, then:
 1. Set OPTION_CODES to your model's serving option codes, in positional order.
 2. Implement _prompt_token_ids with your model's serving format and tokenization.
+3. For --packed-read, set STATE_END_TOKEN to your model's state separator.
+   Every question about the same state must share the same token IDs up to
+   and including that token.
 
 Keep prompt helpers in this file so it can load from an exported checkpoint.
 See examples/decision_model/prompt_module.py for a synthetic implementation.
 """
 
 OPTION_CODES = ()  # TODO: supply one code per supported option position.
+STATE_END_TOKEN = None  # Optional: special token that ends the state (--packed-read).
 
 
 def candidate_codes(tokenizer):
@@ -27,6 +31,16 @@ def candidate_codes(tokenizer):
     if len({token_id for _, token_id in codes}) != len(codes):
         raise ValueError("Option codes must have distinct token IDs")
     return codes
+
+
+def state_end_token_id(tokenizer):
+    """Return the token ID that ends the state in every prompt (used by --packed-read)."""
+    if STATE_END_TOKEN is None:
+        raise NotImplementedError("Set STATE_END_TOKEN to train or read packed")
+    ids = tokenizer.encode(STATE_END_TOKEN, add_special_tokens=False)
+    if len(ids) != 1:
+        raise ValueError(f"State-end token {STATE_END_TOKEN!r} must be one token")
+    return ids[0]
 
 
 def _prompt_token_ids(tokenizer, state, instructions, options):

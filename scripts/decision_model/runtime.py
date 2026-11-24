@@ -6,6 +6,12 @@
 The model-supplied prompt module exposes candidate_codes(tokenizer) and
 prepare_questions(tokenizer, payload, position_ordering=True, permutation=None).
 DecisionRows validates the resulting labels, token IDs, and targets.
+
+With packed_read=True the module also exposes state_end_token_id(tokenizer): the
+token that closes the state in every prompt. A row's questions are then read in
+one sequence, [state][question 1, mask][question 2, mask] ...: the state attends
+only to the state, each question to the state and itself, question positions
+restart after the state, and each question is read at its own mask token.
 """
 
 from __future__ import annotations
@@ -60,9 +66,20 @@ def load_prompt_module(path: str | Path) -> ModuleType:
 
 
 class DecisionRows:
-    """Validate one-question rows and prepare model-supplied prompt records."""
+    """Validate decision rows and prepare model-supplied prompt records.
 
-    def __init__(self, tokenizer, prompt_module: str | Path, max_tokens: int):
+    By default each row holds exactly one question. With packed_read=True a row
+    may hold several questions about one state (reference.targets maps each
+    question key to its label) and prepares one packed example.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        prompt_module: str | Path,
+        max_tokens: int,
+        packed_read: bool = False,
+    ):
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
         self.module_path = Path(prompt_module).resolve()
@@ -74,8 +91,23 @@ class DecisionRows:
             not isinstance(code, (list, tuple)) or len(code) != 2 for code in self.codes
         ):
             raise ValueError("candidate_codes must return (code, token_id) pairs")
+        self.packed_read = packed_read
+        self.state_end_id = None
+        if packed_read:
+            state_end = getattr(self.scoring, "state_end_token_id", None)
+            if not callable(state_end):
+                raise ValueError(
+                    f"Prompt module {self.module_path} must define callable "
+                    "state_end_token_id for packed reads"
+                )
+            token = state_end(tokenizer)
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError("state_end_token_id must return a non-negative token ID")
+            self.state_end_id = token
 
     def __call__(self, row: dict, shuffle_seed: int | None = None) -> dict | None:
+        if self.packed_read:
+            return self._packed(row, shuffle_seed)
         if not isinstance(row, dict):
             raise ValueError("Decision row must be an object")
         payload = row.get("input")
@@ -101,9 +133,16 @@ class DecisionRows:
         )
         if not isinstance(prepared, (list, tuple)) or len(prepared) != 1:
             raise ValueError("Prompt module must return exactly one prepared question")
-        if not isinstance(prepared[0], (list, tuple)) or len(prepared[0]) != 5:
+        example = self._question(prepared[0], reference["target"], row.get("soft_labels"))
+        if len(example["ids"]) + 1 > self.max_tokens:
+            return None
+        return example
+
+    def _question(self, prepared, gold, soft) -> dict:
+        """Validate one prepared question and its target."""
+        if not isinstance(prepared, (list, tuple)) or len(prepared) != 5:
             raise ValueError("Prepared questions must contain key, kind, labels, descriptions, IDs")
-        _, kind, labels, _descriptions, ids = prepared[0]
+        _, kind, labels, _descriptions, ids = prepared
         if not isinstance(labels, (list, tuple)) or any(
             not isinstance(label, str) or not label for label in labels
         ):
@@ -111,7 +150,6 @@ class DecisionRows:
         labels = list(labels)
         if len(labels) < 2 or len(set(labels)) != len(labels):
             raise ValueError("Decision labels must contain at least two unique labels")
-        gold = reference["target"]
         gold = str(gold).lower() if kind == "noul" else str(gold)
         if gold not in labels:
             raise ValueError(f"Unknown decision target: {gold!r}")
@@ -134,7 +172,6 @@ class DecisionRows:
             raise ValueError("Option-code token IDs must be non-negative integers")
         if len(set(candidates)) != len(candidates):
             raise ValueError("Option-code token IDs must be unique")
-        soft = row.get("soft_labels")
         if soft is not None:
             if not isinstance(soft, dict) or set(soft) - set(labels):
                 raise ValueError("soft_labels must map only known decision labels to weights")
@@ -150,8 +187,6 @@ class DecisionRows:
             scaled = [weight / scale for weight in weights]
             total = math.fsum(scaled)
             soft = [weight / total for weight in scaled]
-        if len(ids) + 1 > self.max_tokens:
-            return None
         return {
             "ids": ids,
             "gold": labels.index(gold),
@@ -159,6 +194,158 @@ class DecisionRows:
             "cand": candidates,
             "labels": labels,
         }
+
+    def _packed(self, row: dict, shuffle_seed: int | None) -> dict | None:
+        """Prepare all questions of one state as a packed example."""
+        if not isinstance(row, dict):
+            raise ValueError("Decision row must be an object")
+        payload = row.get("input")
+        questions = payload.get("questions") if isinstance(payload, dict) else None
+        if not isinstance(questions, dict) or not questions:
+            raise ValueError("Decision rows must contain at least one input question")
+        reference = row.get("reference")
+        if not isinstance(reference, dict):
+            raise ValueError("Decision row lacks reference")
+        soft = row.get("soft_labels")
+        if len(questions) == 1 and "target" in reference:
+            targets = {next(iter(questions)): reference["target"]}
+            softs = {next(iter(questions)): soft}
+        else:
+            targets = reference.get("targets")
+            if not isinstance(targets, dict) or set(targets) != set(questions):
+                raise ValueError("Packed rows need reference.targets for every question key")
+            if soft is not None:
+                raise ValueError("soft_labels apply only to one-question rows")
+            softs = {}
+        permutation = None
+        if shuffle_seed is not None:
+
+            def permutation(_key: str, size: int) -> list[int]:
+                order = list(range(size))
+                random.Random(shuffle_seed).shuffle(order)
+                return order
+
+        prepared = self.scoring.prepare_questions(
+            self.tokenizer,
+            dict(payload, model="decision-model"),
+            position_ordering=True,
+            permutation=permutation,
+        )
+        if not isinstance(prepared, (list, tuple)) or len(prepared) != len(questions):
+            raise ValueError("Prompt module must return one prepared question per input question")
+        keys = [item[0] if isinstance(item, (list, tuple)) and item else None for item in prepared]
+        if sorted(map(str, keys)) != sorted(map(str, questions)) or len(set(keys)) != len(keys):
+            raise ValueError("Prepared question keys must match the input questions")
+        examples = [
+            dict(self._question(item, targets[item[0]], softs.get(item[0])), key=item[0])
+            for item in prepared
+        ]
+        state_length = packed_state_length(
+            [example["ids"] for example in examples], self.state_end_id
+        )
+        state = examples[0]["ids"][:state_length]
+        packed_questions = []
+        for example in examples:
+            packed_questions.append(dict(example, ids=example["ids"][state_length:]))
+        packed = {"packed": True, "state": state, "questions": packed_questions}
+        if packed_length(packed) > self.max_tokens:
+            return None
+        return packed
+
+
+def packed_options(packed_read: bool) -> dict:
+    """DecisionRows keyword arguments; empty for single reads to keep that call unchanged."""
+    return {"packed_read": True} if packed_read else {}
+
+
+def packed_state_length(prompts: list[list[int]], state_end_id: int) -> int:
+    """Length of the shared state: every prompt up to and including state_end_id."""
+    lengths = set()
+    for ids in prompts:
+        if state_end_id not in ids:
+            raise ValueError("Packed reads need the state-end token in every prompt")
+        lengths.add(ids.index(state_end_id) + 1)
+    if len(lengths) != 1:
+        raise ValueError("Packed questions must share one state boundary")
+    length = lengths.pop()
+    if any(ids[:length] != prompts[0][:length] for ids in prompts[1:]):
+        raise ValueError("Packed questions must share the state token IDs")
+    return length
+
+
+def packed_length(example: dict) -> int:
+    """Token count of a packed example, including one mask token per question."""
+    return len(example["state"]) + sum(
+        len(question["ids"]) + 1 for question in example["questions"]
+    )
+
+
+def example_length(example: dict) -> int:
+    """Token count read for a prepared example, including mask tokens."""
+    return packed_length(example) if example.get("packed") else len(example["ids"]) + 1
+
+
+def example_questions(example: dict) -> list[dict]:
+    """Questions of a prepared example in readout order."""
+    return example["questions"] if example.get("packed") else [example]
+
+
+def packed_layout(example: dict, mask_id: int) -> dict:
+    """One packed read: token IDs, positions, attention groups, and mask-token slots.
+
+    groups[i] is -1 for state tokens and k for question k. Token i attends to
+    token j when groups[j] is -1, or when both belong to the same question.
+    """
+    state = list(example["state"])
+    ids = list(state)
+    positions = list(range(len(state)))
+    groups = [-1] * len(state)
+    slots = []
+    for index, question in enumerate(example["questions"]):
+        block = list(question["ids"]) + [mask_id]
+        ids += block
+        positions += range(len(state), len(state) + len(block))
+        groups += [index] * len(block)
+        slots.append(len(ids) - 1)
+    return {"ids": ids, "positions": positions, "groups": groups, "slots": slots}
+
+
+def packed_attention(groups: torch.Tensor) -> torch.Tensor:
+    """Boolean [batch, query, key] attention for packed groups; -2 marks padding."""
+    state_key = groups[:, None, :] == -1
+    same_question = (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
+    return state_key | same_question
+
+
+def collate_packed(
+    examples: list[dict],
+    *,
+    mask_id: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Right-pad packed reads; return IDs, positions, attention, and readout rows/slots."""
+    if not examples:
+        raise ValueError("Cannot collate an empty example list")
+    layouts = [packed_layout(example, mask_id) for example in examples]
+    max_length = max(len(layout["ids"]) for layout in layouts)
+    input_ids = torch.full((len(layouts), max_length), mask_id, dtype=torch.long)
+    position_ids = torch.zeros((len(layouts), max_length), dtype=torch.long)
+    groups = torch.full((len(layouts), max_length), -2, dtype=torch.long)
+    rows, slots = [], []
+    for index, layout in enumerate(layouts):
+        length = len(layout["ids"])
+        input_ids[index, :length] = torch.tensor(layout["ids"])
+        position_ids[index, :length] = torch.tensor(layout["positions"])
+        groups[index, :length] = torch.tensor(layout["groups"])
+        rows += [index] * len(layout["slots"])
+        slots += layout["slots"]
+    return (
+        input_ids.to(device),
+        position_ids.to(device),
+        packed_attention(groups).to(device),
+        torch.tensor(rows, device=device, dtype=torch.long),
+        torch.tensor(slots, device=device, dtype=torch.long),
+    )
 
 
 def enable_bidirectional(model: nn.Module) -> None:
@@ -195,15 +382,31 @@ class Scorer(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         readout_positions: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        allowed: torch.Tensor | None = None,
+        readout_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Return vocabulary logits at the readout positions.
+
+        Packed reads pass position_ids, a boolean [batch, query, key] allowed
+        matrix, and readout_rows naming the batch row of each readout position.
+        """
         encoder = self.inner.encoder
         hidden = encoder.embed_tokens(input_ids)
         sequence_length = input_ids.shape[1]
         cache_position = torch.arange(sequence_length, device=input_ids.device)
-        position_ids = cache_position.unsqueeze(0)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
         additive_mask = None
-        if attention_mask is not None:
+        if allowed is not None:
+            additive_mask = torch.zeros(
+                (input_ids.shape[0], 1, sequence_length, sequence_length),
+                device=input_ids.device,
+                dtype=hidden.dtype,
+            )
+            additive_mask.masked_fill_(~allowed[:, None].bool(), torch.finfo(hidden.dtype).min)
+        elif attention_mask is not None:
             additive_mask = torch.zeros(
                 (input_ids.shape[0], 1, 1, sequence_length),
                 device=input_ids.device,
@@ -235,7 +438,11 @@ class Scorer(nn.Module):
                 device=input_ids.device,
                 dtype=torch.long,
             )
-        batch_indices = torch.arange(input_ids.shape[0], device=input_ids.device)
+        batch_indices = (
+            readout_rows
+            if readout_rows is not None
+            else torch.arange(input_ids.shape[0], device=input_ids.device)
+        )
         logits = self.inner.diffusion_head(hidden[batch_indices, readout_positions]).float()
         return logits.clone()
 
@@ -283,3 +490,50 @@ def batched_option_logits(
     )
     vocabulary_logits = scorer(input_ids, attention_mask, readout_positions)
     return [vocabulary_logits[index, example["cand"]] for index, example in enumerate(examples)]
+
+
+def packed_option_logits(
+    examples: list[dict],
+    scorer: Scorer,
+    *,
+    mask_id: int,
+    device: torch.device,
+) -> list[list[torch.Tensor]]:
+    """Option-code logits of every question of each packed example."""
+    input_ids, position_ids, allowed, rows, slots = collate_packed(
+        examples, mask_id=mask_id, device=device
+    )
+    vocabulary_logits = scorer(
+        input_ids,
+        readout_positions=slots,
+        position_ids=position_ids,
+        allowed=allowed,
+        readout_rows=rows,
+    )
+    output, offset = [], 0
+    for example in examples:
+        questions = example["questions"]
+        output.append(
+            [
+                vocabulary_logits[offset + index, question["cand"]]
+                for index, question in enumerate(questions)
+            ]
+        )
+        offset += len(questions)
+    return output
+
+
+def example_option_logits(
+    examples: list[dict],
+    scorer: Scorer,
+    *,
+    mask_id: int,
+    device: torch.device,
+) -> list[list[torch.Tensor]]:
+    """Per-question option-code logits for single or packed examples."""
+    if all(example.get("packed") for example in examples):
+        return packed_option_logits(examples, scorer, mask_id=mask_id, device=device)
+    if any(example.get("packed") for example in examples):
+        raise ValueError("Cannot mix packed and single-read examples in one batch")
+    logits = batched_option_logits(examples, scorer, mask_id=mask_id, device=device)
+    return [[value] for value in logits]

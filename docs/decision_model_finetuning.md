@@ -90,7 +90,8 @@ for details.
 - `scripts/decision_model/split_data.py`: stratified train/validation/test splits.
 - `scripts/decision_model/finetune_fsdp2.py`: LoRA and full fine-tuning.
 - `scripts/decision_model/runtime.py`: prompt-module loading, input validation,
-  batching, and bidirectional option-code readout shared by fine-tuning/evaluation.
+  batching, packed reads, and bidirectional option-code readout shared by
+  fine-tuning/evaluation.
 - `scripts/shared/fsdp2_common.py`: shared FSDP2, scheduling, and checkpoint helpers.
 - `scripts/decision_model/checkpoint_manifest.py`: checkpoint inventory and checksums.
 - `scripts/decision_model/validate_checkpoint.py`: manifest verification, CUDA reload,
@@ -337,6 +338,88 @@ Reports include accuracy, F1, log loss, and calibration metrics. Evaluation
 requires complete coverage; scoring also verifies the supplied run metadata
 against the input and prediction files. Use each script's `--help` for
 additional options.
+
+## 6. Always-packed (state-blind) training
+
+Some decision models serve several questions about one state in a single
+sequence: the state once, then each question followed by its own mask token.
+To fine-tune such a model, add `--packed-read` to train in the same layout:
+
+```text
+[state][question 1 ... mask][question 2 ... mask] ... [question n ... mask]
+```
+
+- The state attends only to the state, so it is encoded without seeing any
+  question (state-blind).
+- Each question attends to the state and to itself, never to another question.
+- Question positions restart after the state.
+- Each question is read at its own mask token, with the same loss as a single
+  read. A row's loss is the mean over its questions.
+
+A question's answer therefore does not depend on which or how many other
+questions share its sequence. The flag is off by default; without it, training
+and evaluation are unchanged.
+
+### Prompt module
+
+Set `STATE_END_TOKEN` to the special token your decision model uses to mark
+the end of the state. Your prompt module returns its ID from
+`state_end_token_id(tokenizer)`. Every question about the same state must
+share the same token IDs up to and including this token. The
+[template](../templates/decision_prompt.py) and the
+[synthetic example](../examples/decision_model/prompt_module.py) include both.
+
+### Data
+
+One-question rows from step 1 work unchanged; each is read as a one-question
+pack. A row may also hold several questions about one state, with one target per
+question key:
+
+```jsonl
+{"id":"news-007","input":{"state":"Example Corp acquired Sample Labs.","questions":{"event":{"type":"choice","instructions":"Which event best describes this headline?","criteria":{"acquisition":"One company buys another.","other":"None of the listed events."}},"sector":{"type":"choice","instructions":"Which sector is the buyer in?","criteria":{"technology":"Software or hardware.","finance":"Banking or payments."}}}},"reference":{"targets":{"event":"acquisition","sector":"technology"}}}
+```
+
+`soft_labels` apply to one-question rows. A row whose packed sequence exceeds
+`--max-tokens` is excluded, as in section 2.
+
+### Commands
+
+Add `--packed-read` to the commands of sections 2 to 5:
+
+```bash
+torchrun --standalone --nproc-per-node=4 --module scripts.decision_model.finetune_fsdp2 \
+  --method lora \
+  --checkpoint "$CHECKPOINT" \
+  --prompt-module "$PROMPT_MODULE" \
+  --train "$TRAIN_JSONL" \
+  --output "$RUN_ROOT/lora-packed" \
+  --lr 3e-5 \
+  --batch 4 \
+  --per-device-batch-size 1 \
+  --rank 32 \
+  --alpha 64 \
+  --epochs 1 \
+  --packed-read \
+  --no-save-best
+
+CUDA_VISIBLE_DEVICES=0 python -m scripts.decision_model.validate_checkpoint \
+  --checkpoint "$RUN_ROOT/lora-packed/last" \
+  --data "$VALIDATION_JSONL" \
+  --method lora \
+  --packed-read
+
+python -m scripts.decision_model.evaluate \
+  --checkpoint "$RUN_ROOT/lora-packed/last" \
+  --input "$TEST_JSONL" \
+  --output-dir "$RESULTS_ROOT/lora-packed-test" \
+  --gpus 0,1,2,3 \
+  --packed-read
+```
+
+With `--packed-read`, the validator also reads the first validation row packed
+and reports its prediction. The evaluator reads each one-question test row as a
+one-question pack, which gives the same probabilities as reading that question
+packed together with others.
 
 ## CPU checks
 
