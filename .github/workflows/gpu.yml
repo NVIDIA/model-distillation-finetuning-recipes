@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: gpu
+
+# A single-GPU smoke test on every pull request, on NVIDIA's shared L4 runner. It builds
+# docker/Dockerfile and runs tests/gpu/smoke.sh in it: the CPU suite, then LoRA and
+# distillation on small public Qwen3 models (train, save, resume, export, reload).
+#
+# Not covered here: multi-GPU FSDP sharding and multi-node runs, the mamba kernels, and
+# the decision-model GPU steps. Those stay in docs/gpu_validation.md.
+#
+# Pull requests reach the GPU through copy-pr-bot (.github/copy-pr-bot.yaml), never
+# through a `pull_request` trigger: the runner pool is shared and this repository is
+# public. The bot copies a PR's head to `pull-request/<number>` and the push below starts
+# this job. PRs from people with write access are copied once ready for review; anyone
+# else's wait for a maintainer to read the change and comment `/ok to test <sha>`.
+#
+# Runner access: nv-gpu-general, granted per repository in
+# nv-gha-runners/enterprise-runner-configuration.
+
+on:
+  push:
+    branches: ["pull-request/[0-9]+"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same PR supersedes the run in flight.
+  group: gpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu:
+    runs-on: linux-amd64-gpu-l4-latest-1
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Which GPU
+        run: nvidia-smi
+
+      - name: Build the image
+        run: docker build -t "mdfr:ci-${GITHUB_SHA::7}" docker
+
+      - name: Smoke test
+        run: |
+          docker run --rm --gpus all --ipc=host \
+            -v "$GITHUB_WORKSPACE:/workspace/model-distillation-finetuning-recipes" \
+            "mdfr:ci-${GITHUB_SHA::7}" bash tests/gpu/smoke.sh
