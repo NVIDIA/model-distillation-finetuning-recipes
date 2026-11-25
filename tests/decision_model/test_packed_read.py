@@ -402,12 +402,25 @@ def question_references():
     return [
         {
             "id": "multi",
-            "input": {"state": "s", "questions": {"event": {}, "deal": {}}},
+            "input": {
+                "state": "s",
+                "questions": {
+                    "event": question("acquisition", "other"),
+                    "deal": {
+                        "type": "noul",
+                        "instructions": "Is this a deal?",
+                        "criteria": {"false": "No", "true": "Yes"},
+                    },
+                },
+            },
             "reference": {"targets": {"event": "acquisition", "deal": "TRUE"}},
         },
         {
             "id": "single",
-            "input": {"state": "s", "questions": {"event": {}}},
+            "input": {
+                "state": "s",
+                "questions": {"event": question("acquisition", "other")},
+            },
             "reference": {"target": "other"},
         },
     ]
@@ -453,6 +466,32 @@ def test_question_scoring_requires_an_answer_for_every_target():
     predictions[0]["questions"].pop("deal")
     with pytest.raises(ValueError, match="do not match reference.targets"):
         score_all(question_references(), predictions, None)
+
+
+def test_question_scoring_requires_exact_criteria_probability_labels():
+    from scripts.decision_model.score import score_all
+
+    predictions = question_predictions()
+    predictions[0]["questions"]["event"]["probs"].pop("other")
+    with pytest.raises(ValueError, match="probability labels do not match expected labels"):
+        score_all(question_references(), predictions, None)
+
+
+def test_question_scoring_requires_targets_for_exact_input_questions():
+    from scripts.decision_model.score import score_all
+
+    references = question_references()
+    references[0]["reference"]["targets"]["invented"] = "acquisition"
+    with pytest.raises(ValueError, match="invalid reference.targets"):
+        score_all(references, question_predictions(), None)
+
+
+def test_packed_read_provenance_is_retained_and_reported():
+    from scripts.decision_model.score import RUN_METADATA_FIELDS, run_markdown_lines
+
+    assert "packed_read" in RUN_METADATA_FIELDS
+    assert "- Read layout: packed (state-blind)" in run_markdown_lines({"packed_read": True})
+    assert "- Read layout: single" in run_markdown_lines({"packed_read": False})
 
 
 def test_score_cli_reports_per_question_metrics_without_taxonomy(tmp_path):

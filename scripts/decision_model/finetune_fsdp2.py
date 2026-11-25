@@ -679,6 +679,7 @@ def export_checkpoint(
     rank: int,
     prompt_module: Path,
     drop_config_keys: list[str],
+    packed_read: bool,
 ) -> None:
     """Gather full weights, verify a staged checkpoint, and publish HF shards."""
     if method == "full":
@@ -750,6 +751,7 @@ def export_checkpoint(
                     "derived_from": source,
                     "source_revision": source_revision or None,
                     "method": method,
+                    "packed_read": packed_read,
                     "merged_model_sha256": manifest["sha256"],
                     "code_commit": os.environ.get("CODE_COMMIT", "unknown"),
                 },
@@ -765,6 +767,7 @@ def export_checkpoint(
                     "source_revision": source_revision or None,
                     "trainer": "scripts/decision_model/finetune_fsdp2.py",
                     "code_commit": os.environ.get("CODE_COMMIT", "unknown"),
+                    "packed_read": packed_read,
                     "fsdp2": True,
                     "state_dict_implementation": state_dict_implementation,
                     "tensor_count": len(state),
@@ -1054,6 +1057,7 @@ def _run(argv: list[str] | None = None) -> None:
             rank=rank,
             prompt_module=prompt_module,
             drop_config_keys=args.drop_config_key,
+            packed_read=args.packed_read,
         )
     step = start_step
     epoch = step // steps_per_epoch
@@ -1207,6 +1211,7 @@ def _run(argv: list[str] | None = None) -> None:
                         rank=rank,
                         prompt_module=prompt_module,
                         drop_config_keys=args.drop_config_key,
+                        packed_read=args.packed_read,
                     )
 
     audited_delta = audited_parameter_delta(
@@ -1243,6 +1248,7 @@ def _run(argv: list[str] | None = None) -> None:
             rank=rank,
             prompt_module=prompt_module,
             drop_config_keys=args.drop_config_key,
+            packed_read=args.packed_read,
         )
     if (
         completed
