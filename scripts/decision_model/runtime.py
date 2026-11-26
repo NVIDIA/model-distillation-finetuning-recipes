@@ -336,7 +336,7 @@ def packed_mask_mod(groups: torch.Tensor):
 
 
 def packed_block_mask(groups: torch.Tensor):
-    """Build a FlexAttention BlockMask without materializing token-pair permissions."""
+    """Build a compact FlexAttention BlockMask from packed group IDs."""
     if create_block_mask is None:
         raise RuntimeError("Packed FlexAttention requires torch.nn.attention.flex_attention")
     length = groups.shape[1]

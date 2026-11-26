@@ -422,8 +422,8 @@ and reports its prediction for every question.
 ### Optional FlexAttention backend
 
 Packed training uses a dense token-pair mask by default. On PyTorch builds with
-FlexAttention support, the equivalent block mask can avoid materializing that
-quadratic mask:
+FlexAttention support, the equivalent block mask avoids carrying a dense
+additive mask through every attention layer:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 --module scripts.decision_model.finetune_fsdp2 \
@@ -436,7 +436,8 @@ torchrun --standalone --nproc-per-node=4 --module scripts.decision_model.finetun
 `--packed-attention flex` requires both other options shown above. The dense
 backend remains the portable default. FlexAttention performance and memory use
 are hardware-, shape-, and PyTorch-version-dependent, so benchmark both methods
-at the intended production batch size before selecting it.
+at the intended production batch size before selecting it. PyTorch may
+materialize a temporary boolean mask while constructing the BlockMask.
 
 ### Evaluate several questions per state
 
