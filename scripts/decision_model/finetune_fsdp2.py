@@ -234,6 +234,90 @@ def read_jsonl(path: str) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def canonical_training_metadata(
+    rows: list[dict],
+    prepare,
+    *,
+    device: torch.device | None = None,
+    group=None,
+) -> tuple[list[int], list[int]]:
+    """Return canonical lengths and usable row indices on every rank."""
+    distributed = all(
+        hasattr(dist, name)
+        for name in ("is_initialized", "get_world_size", "get_rank", "all_reduce")
+    ) and dist.is_initialized()
+    world = dist.get_world_size(group) if distributed else 1
+    rank = dist.get_rank(group) if distributed else 0
+    if world == 1:
+        canonical_lengths = [0] * len(rows)
+        usable = []
+        for index, row in enumerate(rows):
+            example = prepare(row)
+            if example is not None:
+                usable.append(index)
+                canonical_lengths[index] = example_length(example)
+        return canonical_lengths, usable
+
+    if device is None:
+        raise ValueError("device is required for distributed canonical metadata")
+
+    local_lengths = [-1] * len(rows)
+    local_failure: tuple[str, str] | None = None
+    local_failure_index = len(rows)
+    for index in range(rank, len(rows), world):
+        try:
+            example = prepare(rows[index])
+            local_lengths[index] = 0 if example is None else example_length(example)
+        except Exception as error:  # noqa: BLE001 -- synchronize arbitrary row failures
+            local_failure_index = index
+            local_failure = (
+                f"{type(error).__module__}.{type(error).__qualname__}",
+                str(error),
+            )
+            break
+
+    minimum_count = torch.tensor(len(rows), device=device, dtype=torch.int64)
+    maximum_count = minimum_count.clone()
+    dist.all_reduce(minimum_count, op=dist.ReduceOp.MIN, group=group)
+    dist.all_reduce(maximum_count, op=dist.ReduceOp.MAX, group=group)
+    if minimum_count.item() != maximum_count.item():
+        raise RuntimeError(
+            "Training row count differs across ranks: "
+            f"min={minimum_count.item()}, max={maximum_count.item()}"
+        )
+
+    failure_index = torch.tensor(local_failure_index, device=device, dtype=torch.int64)
+    dist.all_reduce(failure_index, op=dist.ReduceOp.MIN, group=group)
+    first_failure = int(failure_index.item())
+    if first_failure < len(rows):
+        owner = first_failure % world
+        global_owner = dist.get_global_rank(group, owner) if group is not None else owner
+        failure = [local_failure if rank == owner else None]
+        dist.broadcast_object_list(
+            failure,
+            src=global_owner,
+            group=group,
+            device=device,
+        )
+        error_type, message = failure[0]
+        raise RuntimeError(
+            f"Training row {first_failure} preprocessing failed "
+            f"with {error_type}: {message}"
+        )
+
+    lengths = torch.tensor(local_lengths, device=device, dtype=torch.int64)
+    dist.all_reduce(lengths, op=dist.ReduceOp.MAX, group=group)
+    canonical_lengths = lengths.cpu().tolist()
+    if any(length < 0 for length in canonical_lengths):
+        raise RuntimeError("Canonical metadata exchange left unowned training rows")
+    usable = [
+        index
+        for index, canonical_length in enumerate(canonical_lengths)
+        if canonical_length > 0
+    ]
+    return canonical_lengths, usable
+
+
 class LoRALinear(nn.Module):
     """A frozen linear projection with a trainable low-rank update."""
 
@@ -873,13 +957,17 @@ def _run(argv: list[str] | None = None) -> None:
     source_train_rows = len(rows)
     if args.train_limit:
         rows = rows[: args.train_limit]
-    canonical_lengths = [0] * len(rows)
-    usable = []
-    for index, row in enumerate(rows):
-        example = prepare(row)
-        if example is not None:
-            usable.append(index)
-            canonical_lengths[index] = example_length(example)
+    metadata_group = dist.new_group(backend="gloo") if world > 1 else None
+    try:
+        canonical_lengths, usable = canonical_training_metadata(
+            rows,
+            prepare,
+            device=torch.device("cpu"),
+            group=metadata_group,
+        )
+    finally:
+        if metadata_group is not None:
+            dist.destroy_process_group(metadata_group)
     eval_rows = read_jsonl(args.eval) if args.eval else []
     if args.eval_limit:
         eval_rows = eval_rows[: args.eval_limit]
