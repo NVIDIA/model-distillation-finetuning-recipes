@@ -27,6 +27,12 @@ from types import ModuleType
 import torch
 from torch import nn
 
+try:
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask
+except ImportError:  # pragma: no cover - exercised only by older PyTorch releases
+    BlockMask = None
+    create_block_mask = None
+
 
 def resolve_prompt_module(checkpoint: str | Path, prompt_module: str | Path | None = None) -> Path:
     """Resolve an explicit prompt module or the module shipped with a snapshot."""
@@ -318,15 +324,44 @@ def packed_attention(groups: torch.Tensor) -> torch.Tensor:
     return state_key | same_question
 
 
+def packed_mask_mod(groups: torch.Tensor):
+    """FlexAttention predicate equivalent to packed_attention for compact group IDs."""
+
+    def mask_mod(batch, _head, query, key):
+        query_group = groups[batch, query]
+        key_group = groups[batch, key]
+        return (key_group == -1) | ((query_group >= 0) & (query_group == key_group))
+
+    return mask_mod
+
+
+def packed_block_mask(groups: torch.Tensor):
+    """Build a FlexAttention BlockMask without materializing token-pair permissions."""
+    if create_block_mask is None:
+        raise RuntimeError("Packed FlexAttention requires torch.nn.attention.flex_attention")
+    length = groups.shape[1]
+    return create_block_mask(
+        packed_mask_mod(groups),
+        B=groups.shape[0],
+        H=None,
+        Q_LEN=length,
+        KV_LEN=length,
+        device=groups.device,
+    )
+
+
 def collate_packed(
     examples: list[dict],
     *,
     mask_id: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    attention_backend: str = "dense",
+) -> tuple[torch.Tensor, torch.Tensor, object, torch.Tensor, torch.Tensor]:
     """Right-pad packed reads; return IDs, positions, attention, and readout rows/slots."""
     if not examples:
         raise ValueError("Cannot collate an empty example list")
+    if attention_backend not in {"dense", "flex"}:
+        raise ValueError(f"Unknown packed attention backend: {attention_backend}")
     layouts = [packed_layout(example, mask_id) for example in examples]
     max_length = max(len(layout["ids"]) for layout in layouts)
     input_ids = torch.full((len(layouts), max_length), mask_id, dtype=torch.long)
@@ -340,10 +375,15 @@ def collate_packed(
         groups[index, :length] = torch.tensor(layout["groups"])
         rows += [index] * len(layout["slots"])
         slots += layout["slots"]
+    allowed = (
+        packed_attention(groups).to(device)
+        if attention_backend == "dense"
+        else packed_block_mask(groups.to(device))
+    )
     return (
         input_ids.to(device),
         position_ids.to(device),
-        packed_attention(groups).to(device),
+        allowed,
         torch.tensor(rows, device=device, dtype=torch.long),
         torch.tensor(slots, device=device, dtype=torch.long),
     )
@@ -371,6 +411,25 @@ def enable_bidirectional(model: nn.Module) -> None:
         attention.is_causal = False
 
 
+def configure_attention_implementation(model: nn.Module, implementation: str) -> None:
+    """Apply the selected Transformers attention backend to model config objects."""
+    layers = getattr(getattr(model, "encoder", None), "layers", None)
+    if layers is None:
+        raise ValueError("Checkpoint does not expose encoder.layers")
+    for layer in layers:
+        attention = getattr(layer, "self_attn", None)
+        config = getattr(attention, "config", None)
+        if config is None or not hasattr(config, "_attn_implementation"):
+            if implementation != "flex_attention":
+                continue
+            raise ValueError(
+                f"{type(layer).__name__} does not expose an attention implementation config"
+            )
+        config._attn_implementation = implementation
+    if hasattr(model, "config"):
+        model.config._attn_implementation = implementation
+
+
 class Scorer(nn.Module):
     """Batched prompt IDs to vocabulary logits at each trailing mask token."""
 
@@ -390,7 +449,8 @@ class Scorer(nn.Module):
         """Return vocabulary logits at the readout positions.
 
         Packed reads pass position_ids, a boolean [batch, query, key] allowed
-        matrix, and readout_rows naming the batch row of each readout position.
+        matrix or FlexAttention BlockMask, and readout_rows naming the batch row
+        of each readout position.
         """
         encoder = self.inner.encoder
         hidden = encoder.embed_tokens(input_ids)
@@ -401,12 +461,17 @@ class Scorer(nn.Module):
 
         additive_mask = None
         if allowed is not None:
-            additive_mask = torch.zeros(
-                (input_ids.shape[0], 1, sequence_length, sequence_length),
-                device=input_ids.device,
-                dtype=hidden.dtype,
-            )
-            additive_mask.masked_fill_(~allowed[:, None].bool(), torch.finfo(hidden.dtype).min)
+            if BlockMask is not None and isinstance(allowed, BlockMask):
+                additive_mask = allowed
+            else:
+                additive_mask = torch.zeros(
+                    (input_ids.shape[0], 1, sequence_length, sequence_length),
+                    device=input_ids.device,
+                    dtype=hidden.dtype,
+                )
+                additive_mask.masked_fill_(
+                    ~allowed[:, None].bool(), torch.finfo(hidden.dtype).min
+                )
         elif attention_mask is not None:
             additive_mask = torch.zeros(
                 (input_ids.shape[0], 1, 1, sequence_length),
@@ -499,10 +564,14 @@ def packed_option_logits(
     *,
     mask_id: int,
     device: torch.device,
+    attention_backend: str = "dense",
 ) -> list[list[torch.Tensor]]:
     """Option-code logits of every question of each packed example."""
     input_ids, position_ids, allowed, rows, slots = collate_packed(
-        examples, mask_id=mask_id, device=device
+        examples,
+        mask_id=mask_id,
+        device=device,
+        attention_backend=attention_backend,
     )
     vocabulary_logits = scorer(
         input_ids,
@@ -530,10 +599,17 @@ def example_option_logits(
     *,
     mask_id: int,
     device: torch.device,
+    packed_attention_backend: str = "dense",
 ) -> list[list[torch.Tensor]]:
     """Per-question option-code logits for single or packed examples."""
     if all(example.get("packed") for example in examples):
-        return packed_option_logits(examples, scorer, mask_id=mask_id, device=device)
+        return packed_option_logits(
+            examples,
+            scorer,
+            mask_id=mask_id,
+            device=device,
+            attention_backend=packed_attention_backend,
+        )
     if any(example.get("packed") for example in examples):
         raise ValueError("Cannot mix packed and single-read examples in one batch")
     logits = batched_option_logits(examples, scorer, mask_id=mask_id, device=device)

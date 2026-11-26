@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from scripts.decision_model import finetune_fsdp2 as TRAINER
 from scripts.decision_model.runtime import (
@@ -18,6 +19,8 @@ from scripts.decision_model.runtime import (
     example_option_logits,
     load_prompt_module,
     packed_attention,
+    packed_block_mask,
+    packed_mask_mod,
     packed_layout,
     packed_option_logits,
     packed_state_length,
@@ -108,6 +111,62 @@ def test_packed_layout_matches_reference_golden():
         for key, key_group in enumerate(groups):
             expected = key_group == -1 or (query_group >= 0 and key_group == query_group)
             assert bool(allowed[query, key]) is expected
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        [-1, 0, -2],
+        [-1] * 127 + [0, 1, -2],
+        [-1] * 128 + [0, 1, -2],
+        [-1] * 129 + [0, 1, -2],
+        [-1] * 5 + [0] * 127 + [1] * 128 + [2] * 129 + [-2] * 3,
+    ],
+)
+def test_packed_flex_predicate_matches_dense_attention(groups):
+    group_tensor = torch.tensor([groups])
+    length = group_tensor.shape[1]
+    query = torch.arange(length)[:, None]
+    key = torch.arange(length)[None, :]
+    actual = packed_mask_mod(group_tensor)(0, 0, query, key)
+
+    assert torch.equal(actual, packed_attention(group_tensor)[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlexAttention requires CUDA")
+def test_packed_flex_attention_matches_dense_forward_and_gradients():
+    from torch.nn.attention.flex_attention import flex_attention
+
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    groups = torch.tensor(
+        [
+            [-1] * 5 + [0] * 61 + [1] * 63 + [-2],
+            [-1] * 7 + [0] * 63 + [1] * 59 + [-2],
+        ],
+        device=device,
+    )
+    shape = (2, 2, groups.shape[1], 16)
+    values = [torch.randn(shape, device=device) for _ in range(3)]
+    upstream = torch.randn(shape, device=device)
+
+    dense_inputs = [value.clone().requires_grad_() for value in values]
+    dense = F.scaled_dot_product_attention(
+        *dense_inputs,
+        attn_mask=packed_attention(groups)[:, None],
+    )
+    dense.backward(upstream)
+
+    flex_inputs = [value.clone().requires_grad_() for value in values]
+    flex = flex_attention(
+        *flex_inputs,
+        block_mask=packed_block_mask(groups),
+    )
+    flex.backward(upstream)
+
+    torch.testing.assert_close(flex, dense, atol=2e-3, rtol=2e-2)
+    for actual, expected in zip(flex_inputs, dense_inputs, strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad, atol=2e-3, rtol=2e-2)
 
 
 def test_packed_rows_prepare_shared_state_and_question_blocks(tmp_path):
@@ -321,6 +380,35 @@ def test_packed_read_flag_is_opt_in_and_recorded_in_resume_signature(tmp_path):
     assert "packed_read" not in TRAINER.resume_signature(args, 1, 1, module)["settings"]
     args.packed_read = True
     assert TRAINER.resume_signature(args, 1, 1, module)["settings"]["packed_read"] is True
+    args = TRAINER.parse_args(
+        [
+            "--method",
+            "lora",
+            "--checkpoint",
+            "org/model",
+            "--model-revision",
+            "abc",
+            "--train",
+            str(train),
+            "--output",
+            "o",
+            "--packed-read",
+            "--packed-attention",
+            "flex",
+            "--attn-implementation",
+            "flex_attention",
+        ]
+    )
+    settings = TRAINER.resume_signature(args, 1, 1, module)["settings"]
+    assert settings["packed_attention"] == "flex"
+
+
+def test_flex_packed_attention_requires_matching_options():
+    base = ["--method", "lora", "--checkpoint", "m", "--train", "t", "--output", "o"]
+    with pytest.raises(SystemExit):
+        TRAINER.parse_args([*base, "--packed-attention", "flex"])
+    with pytest.raises(SystemExit):
+        TRAINER.parse_args([*base, "--packed-read", "--packed-attention", "flex"])
 
 
 class WordTokenizer:

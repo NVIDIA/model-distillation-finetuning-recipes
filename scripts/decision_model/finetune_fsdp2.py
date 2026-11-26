@@ -38,6 +38,7 @@ from scripts.decision_model.checkpoint_manifest import (
 from scripts.decision_model.runtime import (
     DecisionRows,
     Scorer,
+    configure_attention_implementation,
     enable_bidirectional,
     example_length,
     example_questions,
@@ -107,6 +108,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "state never attends to a question (requires state_end_token_id in the "
             "prompt module)"
         ),
+    )
+    parser.add_argument(
+        "--packed-attention",
+        choices=("dense", "flex"),
+        default="dense",
+        help="Packed-read attention representation; flex requires FlexAttention",
     )
 
     parser.add_argument("--lr", type=float)
@@ -212,6 +219,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--stop-step cannot be negative")
     if any(not key or "." in key for key in args.drop_config_key):
         parser.error("--drop-config-key must name a non-empty top-level configuration key")
+    if args.packed_attention == "flex" and not args.packed_read:
+        parser.error("--packed-attention flex requires --packed-read")
+    if args.packed_attention == "flex" and args.attn_implementation != "flex_attention":
+        parser.error("--packed-attention flex requires --attn-implementation flex_attention")
     for option in ("expected_lora_modules", "expected_trainable_parameters"):
         if getattr(args, option) is not None and getattr(args, option) < 1:
             parser.error(f"--{option.replace('_', '-')} must be positive")
@@ -491,6 +502,8 @@ def resume_signature(
     settings = {key: getattr(args, key) for key in keys}
     if getattr(args, "packed_read", False):
         settings["packed_read"] = True
+    if getattr(args, "packed_attention", "dense") != "dense":
+        settings["packed_attention"] = args.packed_attention
     return {
         "settings": settings,
         "world_size": world,
@@ -680,6 +693,7 @@ def export_checkpoint(
     prompt_module: Path,
     drop_config_keys: list[str],
     packed_read: bool,
+    packed_attention: str,
 ) -> None:
     """Gather full weights, verify a staged checkpoint, and publish HF shards."""
     if method == "full":
@@ -752,6 +766,7 @@ def export_checkpoint(
                     "source_revision": source_revision or None,
                     "method": method,
                     "packed_read": packed_read,
+                    "packed_attention": packed_attention,
                     "merged_model_sha256": manifest["sha256"],
                     "code_commit": os.environ.get("CODE_COMMIT", "unknown"),
                 },
@@ -768,6 +783,7 @@ def export_checkpoint(
                     "trainer": "scripts/decision_model/finetune_fsdp2.py",
                     "code_commit": os.environ.get("CODE_COMMIT", "unknown"),
                     "packed_read": packed_read,
+                    "packed_attention": packed_attention,
                     "fsdp2": True,
                     "state_dict_implementation": state_dict_implementation,
                     "tensor_count": len(state),
@@ -888,6 +904,7 @@ def _run(argv: list[str] | None = None) -> None:
     )
     expected_shapes = {name: tuple(value.shape) for name, value in model.state_dict().items()}
     mask_id = int(model.mask_token_id)
+    configure_attention_implementation(model, args.attn_implementation)
     enable_bidirectional(model)
     if not args.no_grad_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -934,7 +951,13 @@ def _run(argv: list[str] | None = None) -> None:
 
     def question_logits(examples: list[dict]) -> list[list[torch.Tensor]]:
         if args.packed_read:
-            return packed_option_logits(examples, scorer, mask_id=mask_id, device=device)
+            return packed_option_logits(
+                examples,
+                scorer,
+                mask_id=mask_id,
+                device=device,
+                attention_backend=args.packed_attention,
+            )
         logits = batched_option_logits(examples, scorer, mask_id=mask_id, device=device)
         return [[value] for value in logits]
 
@@ -1058,6 +1081,7 @@ def _run(argv: list[str] | None = None) -> None:
             prompt_module=prompt_module,
             drop_config_keys=args.drop_config_key,
             packed_read=args.packed_read,
+            packed_attention=args.packed_attention,
         )
     step = start_step
     epoch = step // steps_per_epoch
@@ -1212,6 +1236,7 @@ def _run(argv: list[str] | None = None) -> None:
                         prompt_module=prompt_module,
                         drop_config_keys=args.drop_config_key,
                         packed_read=args.packed_read,
+                        packed_attention=args.packed_attention,
                     )
 
     audited_delta = audited_parameter_delta(
@@ -1249,6 +1274,7 @@ def _run(argv: list[str] | None = None) -> None:
             prompt_module=prompt_module,
             drop_config_keys=args.drop_config_key,
             packed_read=args.packed_read,
+            packed_attention=args.packed_attention,
         )
     if (
         completed

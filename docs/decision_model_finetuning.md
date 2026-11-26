@@ -419,6 +419,25 @@ python -m scripts.decision_model.evaluate \
 With `--packed-read`, the validator also reads the first validation row packed
 and reports its prediction for every question.
 
+### Optional FlexAttention backend
+
+Packed training uses a dense token-pair mask by default. On PyTorch builds with
+FlexAttention support, the equivalent block mask can avoid materializing that
+quadratic mask:
+
+```bash
+torchrun --standalone --nproc-per-node=4 --module scripts.decision_model.finetune_fsdp2 \
+  ... \
+  --packed-read \
+  --packed-attention flex \
+  --attn-implementation flex_attention
+```
+
+`--packed-attention flex` requires both other options shown above. The dense
+backend remains the portable default. FlexAttention performance and memory use
+are hardware-, shape-, and PyTorch-version-dependent, so benchmark both methods
+at the intended production batch size before selecting it.
+
 ### Evaluate several questions per state
 
 With `--packed-read`, test rows may also hold several questions about one state.
