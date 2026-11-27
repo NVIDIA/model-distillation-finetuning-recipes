@@ -75,11 +75,14 @@ def evaluation_inputs(tmp_path, gpus='0,1'):
     return args
 
 
-@pytest.mark.parametrize('setting', [None, 'user-value'])
-def test_native_workers_preserve_caller_environment_and_record_complete_coverage(
-    tmp_path, monkeypatch, setting
+@pytest.mark.parametrize(
+    ('setting', 'native'), [(None, False), ('user-value', False), (None, True)]
+)
+def test_workers_preserve_caller_environment_and_record_complete_coverage(
+    tmp_path, monkeypatch, setting, native
 ):
     args = evaluation_inputs(tmp_path)
+    args.native_decision = native
     # Initialize shared dependencies before isolating the caller environment.
     importlib.import_module('scripts.decision_model.runtime')
     caller_environment = {}
@@ -102,6 +105,8 @@ def test_native_workers_preserve_caller_environment_and_record_complete_coverage
         assert command[:3] == [sys.executable, '-m', 'scripts.decision_model.evaluate']
         assert Path(cwd) == ROOT
         assert '--worker' in command
+        assert ('--native-decision' in command) == native
+        assert ('--prompt-module' in command) != native
         expected_environment = dict(
             caller_environment, CUDA_VISIBLE_DEVICES=env['CUDA_VISIBLE_DEVICES']
         )
@@ -120,6 +125,7 @@ def test_native_workers_preserve_caller_environment_and_record_complete_coverage
                     'predicted_rows': len(records),
                     'failures': 0,
                     'peak_allocated_gib': 1.0,
+                    **({'decision_attention_layout': 'state_sees_no_questions'} if native else {}),
                 }
             )
         )
@@ -132,7 +138,12 @@ def test_native_workers_preserve_caller_environment_and_record_complete_coverage
     assert metadata['evaluator_failures'] == 0
     assert 'scoring_environment' not in metadata
     assert dict(evaluator.os.environ) == caller_environment
-    assert len(metadata['prompt_module_sha256']) == 64
+    if native:
+        assert metadata['decision_attention_layout'] == 'state_sees_no_questions'
+        assert 'config.json' in metadata['preparation_assets']
+        assert 'packed_read' not in metadata
+    else:
+        assert len(metadata['prompt_module_sha256']) == 64
     assert [row['id'] for row in evaluator.read_jsonl(Path(metadata['predictions']))] == [
         'first',
         'second',

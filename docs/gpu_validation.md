@@ -301,3 +301,38 @@ Validate both LoRA and full fine-tuning on the target NVIDIA GPUs:
   split with complete prediction coverage.
 
 Passing CPU tests does not establish completion of these GPU gates.
+
+### Packed-read smoke test
+
+On one node with two NVIDIA GPUs, use the decision recipe's `CHECKPOINT`,
+`PROMPT_MODULE`, `TRAIN_JSONL`, and `VALIDATION_JSONL`. Use multi-question
+validation data and a fresh output directory. A two-rank run exercises
+distributed preprocessing and a FlexAttention forward and backward pass.
+
+```bash
+python -m pytest -q tests/decision_model/test_packed_read.py::test_packed_flex_attention_matches_dense_forward_and_gradients
+
+torchrun --standalone --nproc-per-node=2 --module scripts.decision_model.finetune_fsdp2 \
+  --method lora --checkpoint "$CHECKPOINT" --prompt-module "$PROMPT_MODULE" \
+  --train "$TRAIN_JSONL" --eval "$VALIDATION_JSONL" --output "$OUT/packed-flex-smoke" \
+  --packed-read --packed-attention flex --attn-implementation flex_attention \
+  --batch 2 --per-device-batch-size 1 --max-steps 1 --eval-every 1 --no-save-best
+
+python - "$VALIDATION_JSONL" "$OUT/packed-flex-smoke" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+source, run = map(Path, sys.argv[1:])
+rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+questions = sum(len(row["input"]["questions"]) for row in rows)
+assert questions > len(rows), "include at least one multi-question validation row"
+records = [json.loads(line) for line in (run / "validation.jsonl").read_text().splitlines()]
+assert any(record["step"] == 1 for record in records)
+for record in records:
+    assert (record["rows"], record["questions"]) == (len(rows), questions)
+    assert math.isfinite(record["cross_entropy"])
+assert (run / "SUCCESS").is_file()
+PY
+```

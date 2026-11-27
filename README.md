@@ -139,7 +139,8 @@ size; the script validates these requirements before sharding.
 ## Decision model fine-tuning
 
 Fine-tune a compatible user-supplied decision model with LoRA or full decoder
-updates. Supply its checkpoint, tokenizer, model code, and prompt module.
+updates. Supply the checkpoint and tokenizer, and use its Transformers decision
+interface or a model-specific prompt module.
 See the [recipe](docs/decision_model_finetuning.md) for setup,
 train/validation/test splits, checkpoint selection, and evaluation.
 

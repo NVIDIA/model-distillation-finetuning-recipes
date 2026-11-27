@@ -17,6 +17,9 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   generated artifacts, and reproducibility responsibilities.
 - User-supplied decision-model fine-tuning, synthetic prompt/data examples,
   stratified train/validation/test splits, checkpoint validation, and metrics.
+- Opt-in always-packed (state-blind) decision-model reads with `--packed-read` for
+  fine-tuning, validation, and evaluation, including multi-question rows scored
+  per question and per row.
 
 ### Changed
 

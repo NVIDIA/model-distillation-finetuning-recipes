@@ -3,6 +3,7 @@
 
 import json
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(width, width, bias=False)
         self.diffusion_lm = False
         self.is_causal = True
+        self.config = SimpleNamespace(_attn_implementation="eager")
 
 
 class MLP(nn.Module):
@@ -48,6 +50,7 @@ class Encoder(nn.Module):
 class DecisionModel(nn.Module):
     def __init__(self):
         super().__init__()
+        self.config = SimpleNamespace(_attn_implementation="eager")
         self.encoder = Encoder()
         self.diffusion_head = nn.Linear(8, 32, bias=False)
 
@@ -204,7 +207,13 @@ def test_full_finetune_freezes_embeddings_and_diffusion_head():
 
 def test_bidirectional_flag_and_reference_defaults():
     model = DecisionModel()
+    TRAINER.configure_attention_implementation(model, "flex_attention")
     TRAINER.enable_bidirectional(model)
+    assert model.config._attn_implementation == "flex_attention"
+    assert all(
+        layer.self_attn.config._attn_implementation == "flex_attention"
+        for layer in model.encoder.layers
+    )
     assert all(not layer.self_attn.diffusion_lm for layer in model.encoder.layers)
     assert all(not layer.self_attn.is_causal for layer in model.encoder.layers)
 

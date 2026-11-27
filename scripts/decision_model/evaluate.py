@@ -17,7 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from scripts.decision_model.checkpoint_manifest import file_sha256, weight_manifest
+from scripts.decision_model.checkpoint_manifest import (
+    file_sha256,
+    preparation_assets,
+    weight_manifest,
+)
+from scripts.decision_model.cli import add_native_decision_argument, check_packed_attention
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -103,8 +108,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--gpus", default="0", help="comma-separated physical GPU indices")
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument(
+        "--packed-read",
+        action="store_true",
+        help="Read each question in the packed layout (state attends only to the state)",
+    )
+    add_native_decision_argument(parser)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    check_packed_attention(parser, args)
     if args.max_tokens < 1:
         parser.error("--max-tokens must be positive")
     try:
@@ -114,15 +126,59 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def option_prediction(labels: list[str], probabilities: list[float]) -> dict[str, Any]:
+    """Probability mapping and maximum-probability label of one question."""
+    if len(probabilities) != len(labels) or not all(
+        math.isfinite(value) for value in probabilities
+    ):
+        raise ValueError("model produced invalid option probabilities")
+    return {
+        "probs": dict(zip(labels, probabilities, strict=True)),
+        "pred": labels[max(range(len(labels)), key=probabilities.__getitem__)],
+    }
+
+
+def predict_row(
+    row_id: str, example: dict, scorer, *, mask_id: int | None, device
+) -> dict[str, Any]:
+    """Prediction record of one prepared row.
+
+    One-question rows give {"id", "probs", "pred"}. Packed rows with several
+    questions are read once and give {"id", "questions": {key: {"probs", "pred"}}}.
+    """
+    from scripts.decision_model.runtime import example_option_logits, example_questions
+
+    questions = example_questions(example)
+    if "reads" in example:
+        from scripts.decision_model.native import read_logits
+
+        logits = [value for read in example["reads"] for value in read_logits(read, scorer, device)]
+    else:
+        logits = example_option_logits([example], scorer, mask_id=mask_id, device=device)[0]
+    answers = [
+        option_prediction(question["labels"], values.softmax(-1).cpu().tolist())
+        for question, values in zip(questions, logits, strict=True)
+    ]
+    if len(questions) == 1 and not example.get("multi"):
+        return {"id": row_id, **answers[0]}
+    return {
+        "id": row_id,
+        "questions": {
+            question["key"]: answer for question, answer in zip(questions, answers, strict=True)
+        },
+    }
+
+
 def run_worker(args: argparse.Namespace) -> None:
     import torch
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoTokenizer
 
+    from scripts.decision_model.native import NativeRows, load_decision_model
     from scripts.decision_model.runtime import (
         DecisionRows,
         Scorer,
-        batched_option_logits,
         enable_bidirectional,
+        packed_options,
         resolve_prompt_module,
     )
 
@@ -134,16 +190,25 @@ def run_worker(args: argparse.Namespace) -> None:
     if args.model_revision:
         pretrained_kwargs["revision"] = args.model_revision
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, **pretrained_kwargs)
-    prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
-    prepare = DecisionRows(tokenizer, prompt_module, args.max_tokens)
-    model = AutoModel.from_pretrained(
+    model = load_decision_model(
         args.checkpoint,
+        native=args.native_decision,
         dtype=torch.bfloat16,
         attn_implementation=args.attn_implementation,
         **pretrained_kwargs,
     ).to(device)
-    enable_bidirectional(model)
-    scorer = Scorer(model).eval()
+    if args.native_decision:
+        prepare = NativeRows(model, tokenizer, args.max_tokens, args.packed_read)
+        scorer = model.eval()
+        mask_id = None
+    else:
+        prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
+        prepare = DecisionRows(
+            tokenizer, prompt_module, args.max_tokens, **packed_options(args.packed_read)
+        )
+        enable_bidirectional(model)
+        scorer = Scorer(model).eval()
+        mask_id = int(model.mask_token_id)
     predictions = []
     failures = []
     rows = read_jsonl(args.input)
@@ -154,21 +219,14 @@ def run_worker(args: argparse.Namespace) -> None:
                 example = prepare(row)
                 if example is None:
                     raise ValueError(f"prompt exceeds --max-tokens {args.max_tokens}")
-                logits = batched_option_logits(
-                    [example], scorer, mask_id=int(model.mask_token_id), device=device
-                )[0]
-                probabilities = logits.softmax(-1).cpu().tolist()
-                labels = example["labels"]
-                if len(probabilities) != len(labels) or not all(
-                    math.isfinite(value) for value in probabilities
-                ):
-                    raise ValueError("model produced invalid option probabilities")
                 predictions.append(
-                    {
-                        "id": row["id"],
-                        "probs": dict(zip(labels, probabilities, strict=True)),
-                        "pred": labels[max(range(len(labels)), key=probabilities.__getitem__)],
-                    }
+                    predict_row(
+                        row["id"],
+                        example,
+                        scorer,
+                        mask_id=mask_id,
+                        device=device,
+                    )
                 )
             except Exception as error:
                 if not args.allow_partial:
@@ -184,6 +242,10 @@ def run_worker(args: argparse.Namespace) -> None:
         "failures": len(failures),
         "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
     }
+    if args.native_decision:
+        summary["decision_attention_layout"] = getattr(
+            prepare.config, "decision_attention_layout", None
+        )
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
@@ -195,15 +257,20 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     for required in (checkpoint / "config.json", input_path):
         if not required.is_file():
             raise ValueError(f"required path does not exist: {required}")
-    prompt_module = resolve_prompt_module(checkpoint, args.prompt_module)
+    prompt_module = (
+        None if args.native_decision else resolve_prompt_module(checkpoint, args.prompt_module)
+    )
+    output = args.output_dir.resolve()
+    assets = (
+        preparation_assets(checkpoint, native=True, exclude=output) if args.native_decision else {}
+    )
     input_sha256 = file_sha256(input_path)
-    prompt_module_sha256 = file_sha256(prompt_module)
+    prompt_module_sha256 = file_sha256(prompt_module) if prompt_module else None
     rows = read_jsonl(input_path)
     validate_ids(rows, "input")
     if len(rows) < len(args.gpus):
         raise ValueError(f"{len(rows)} rows cannot be split across {len(args.gpus)} GPUs")
     manifest = weight_manifest(checkpoint)
-    output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     shards_dir = output / "shards"
     logs_dir = output / "logs"
@@ -233,17 +300,21 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 str(shard_path),
                 "--output-dir",
                 str(worker_dir),
-                "--prompt-module",
-                str(prompt_module),
                 "--max-tokens",
                 str(args.max_tokens),
                 "--attn-implementation",
                 args.attn_implementation,
             ]
+            if args.native_decision:
+                command.append("--native-decision")
+            else:
+                command.extend(["--prompt-module", str(prompt_module)])
             if args.model_revision:
                 command.extend(["--model-revision", args.model_revision])
             if args.allow_partial:
                 command.append("--allow-partial")
+            if args.packed_read:
+                command.append("--packed-read")
             environment = os.environ.copy()
             environment["CUDA_VISIBLE_DEVICES"] = gpu
             environment.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -297,8 +368,13 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         ("input", input_path, input_sha256),
         ("prompt module", prompt_module, prompt_module_sha256),
     ):
-        if not path.is_file() or file_sha256(path) != digest:
+        if path is not None and (not path.is_file() or file_sha256(path) != digest):
             raise ValueError(f"{name} changed during evaluation: {path}")
+    if args.native_decision:
+        if preparation_assets(checkpoint, native=True, exclude=output) != assets:
+            raise ValueError("checkpoint preparation assets changed during evaluation")
+        if len({summary["decision_attention_layout"] for summary in summaries}) != 1:
+            raise ValueError("workers used different native decision layouts")
     predictions_path = output / "predictions.jsonl"
     write_jsonl(predictions_path, predictions)
     elapsed = time.monotonic() - started
@@ -319,8 +395,19 @@ def run_evaluation(args: argparse.Namespace) -> dict[str, Any]:
         "model_bytes": manifest["bytes"],
         "weight_files": manifest["files"],
         "index_sha256": manifest.get("index_sha256"),
-        "prompt_module": str(prompt_module),
-        "prompt_module_sha256": prompt_module_sha256,
+        **(
+            {
+                "native_decision": True,
+                "decision_attention_layout": summaries[0]["decision_attention_layout"],
+                "preparation_assets": assets,
+            }
+            if args.native_decision
+            else {
+                "packed_read": args.packed_read,
+                "prompt_module": str(prompt_module),
+                "prompt_module_sha256": prompt_module_sha256,
+            }
+        ),
         "max_tokens": args.max_tokens,
         "attention_implementation": args.attn_implementation,
         "precision": "bfloat16",
