@@ -73,6 +73,36 @@ def load_prompt_module(path: str | Path) -> ModuleType:
     return module
 
 
+def question_supervision(labels, kind, gold, soft) -> dict:
+    """Index gold and normalize soft weights in prepared option order."""
+    if not isinstance(labels, (list, tuple)) or any(
+        not isinstance(label, str) or not label for label in labels
+    ):
+        raise ValueError("Decision labels must be non-empty strings")
+    labels = list(labels)
+    if len(labels) < 2 or len(set(labels)) != len(labels):
+        raise ValueError("Decision labels must contain at least two unique labels")
+    gold = target_label(gold, kind)
+    if gold not in labels:
+        raise ValueError(f"Unknown decision target: {gold!r}")
+    if soft is not None:
+        if not isinstance(soft, dict) or set(soft) - set(labels):
+            raise ValueError("soft_labels must map only known decision labels to weights")
+        try:
+            weights = [float(soft.get(label, 0.0)) for label in labels]
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("soft_labels weights must be numeric") from error
+        if any(not math.isfinite(weight) or weight < 0 for weight in weights):
+            raise ValueError("soft_labels weights must be finite and non-negative")
+        scale = max(weights)
+        if scale <= 0:
+            raise ValueError("soft_labels must have positive total weight")
+        scaled = [weight / scale for weight in weights]
+        total = math.fsum(scaled)
+        soft = [weight / total for weight in scaled]
+    return {"labels": labels, "gold": labels.index(gold), "soft": soft}
+
+
 class DecisionRows:
     """Validate decision rows and prepare model-supplied prompt records.
 
@@ -153,16 +183,7 @@ class DecisionRows:
         if not isinstance(prepared, (list, tuple)) or len(prepared) != 5:
             raise ValueError("Prepared questions must contain key, kind, labels, descriptions, IDs")
         _, kind, labels, _descriptions, ids = prepared
-        if not isinstance(labels, (list, tuple)) or any(
-            not isinstance(label, str) or not label for label in labels
-        ):
-            raise ValueError("Decision labels must be non-empty strings")
-        labels = list(labels)
-        if len(labels) < 2 or len(set(labels)) != len(labels):
-            raise ValueError("Decision labels must contain at least two unique labels")
-        gold = target_label(gold, kind)
-        if gold not in labels:
-            raise ValueError(f"Unknown decision target: {gold!r}")
+        supervision = question_supervision(labels, kind, gold, soft)
         if (
             not isinstance(ids, (list, tuple))
             or not ids
@@ -182,28 +203,7 @@ class DecisionRows:
             raise ValueError("Option-code token IDs must be non-negative integers")
         if len(set(candidates)) != len(candidates):
             raise ValueError("Option-code token IDs must be unique")
-        if soft is not None:
-            if not isinstance(soft, dict) or set(soft) - set(labels):
-                raise ValueError("soft_labels must map only known decision labels to weights")
-            try:
-                weights = [float(soft.get(label, 0.0)) for label in labels]
-            except (TypeError, ValueError, OverflowError) as error:
-                raise ValueError("soft_labels weights must be numeric") from error
-            if any(not math.isfinite(weight) or weight < 0 for weight in weights):
-                raise ValueError("soft_labels weights must be finite and non-negative")
-            scale = max(weights)
-            if scale <= 0:
-                raise ValueError("soft_labels must have positive total weight")
-            scaled = [weight / scale for weight in weights]
-            total = math.fsum(scaled)
-            soft = [weight / total for weight in scaled]
-        return {
-            "ids": ids,
-            "gold": labels.index(gold),
-            "soft": soft,
-            "cand": candidates,
-            "labels": labels,
-        }
+        return {**supervision, "ids": ids, "cand": candidates}
 
     def _packed(self, row: dict, shuffle_seed: int | None) -> dict | None:
         """Prepare all questions of one state as a packed example."""
@@ -282,12 +282,14 @@ def packed_length(example: dict) -> int:
 
 def example_length(example: dict) -> int:
     """Token count read for a prepared example, including mask tokens."""
+    if "reads" in example:
+        return max(read["inputs"]["input_ids"].shape[-1] for read in example["reads"])
     return packed_length(example) if example.get("packed") else len(example["ids"]) + 1
 
 
 def example_questions(example: dict) -> list[dict]:
     """Questions of a prepared example in readout order."""
-    return example["questions"] if example.get("packed") else [example]
+    return example.get("questions", [example])
 
 
 def packed_layout(example: dict, mask_id: int) -> dict:

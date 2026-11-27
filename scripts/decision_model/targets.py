@@ -6,6 +6,18 @@
 from typing import Any
 
 
+def question_options(question: dict) -> list[str]:
+    """Semantic labels for choice, boolean, and ordered-score references."""
+    criteria = question.get("criteria")
+    if question.get("type") == "noul" and (
+        criteria is None or isinstance(criteria, dict) and set(criteria) <= {"false", "true"}
+    ):
+        return ["false", "true"]
+    if question.get("type") == "score" and isinstance(criteria, list):
+        return [str(level) for level in range(len(criteria))]
+    return list(criteria) if isinstance(criteria, dict) else []
+
+
 def question_definitions(row: dict) -> dict[str, dict]:
     """Validate the question keys and label sets used by splitting and scoring."""
     payload = row.get("input")
@@ -15,12 +27,8 @@ def question_definitions(row: dict) -> dict[str, dict]:
     for key, question in questions.items():
         if not isinstance(key, str) or not key or not isinstance(question, dict):
             raise ValueError(f"reference {row.get('id')!r} has invalid input.questions")
-        criteria = question.get("criteria")
-        if (
-            not isinstance(criteria, dict)
-            or len(criteria) < 2
-            or any(not isinstance(label, str) or not label for label in criteria)
-        ):
+        labels = question_options(question)
+        if len(labels) < 2 or any(not isinstance(label, str) or not label for label in labels):
             raise ValueError(
                 f"reference {row.get('id')!r} question {key!r} "
                 "needs at least two unique non-empty criteria labels"

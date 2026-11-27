@@ -115,6 +115,18 @@ def test_resume_signature_detects_continuity_changes(training_inputs, tmp_path, 
     assert actual != expected
 
 
+def test_native_resume_tracks_template_and_interface(training_inputs, tmp_path):
+    inputs = training_inputs
+    args = training.parse_args([*command(inputs, tmp_path / "native"), "--native-decision"])
+    template = inputs.checkpoint / "decision_template.jinja"
+    template.write_text("template one")
+    expected = training.resume_signature(args, 1, 2, None)
+    assert expected["settings"]["native_decision"]
+    assert expected["prompt_module_sha256"] is None
+    template.write_text("template two")
+    assert expected != training.resume_signature(args, 1, 2, None)
+
+
 def test_resume_signature_allows_new_segment_paths(training_inputs, tmp_path):
     inputs = training_inputs
     args = training.parse_args(command(inputs, tmp_path / "first"))

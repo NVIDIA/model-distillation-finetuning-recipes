@@ -18,7 +18,7 @@ from scripts.decision_model.checkpoint_manifest import (
     safetensors_inventory,
     weight_manifest,
 )
-from scripts.decision_model.cli import check_packed_attention
+from scripts.decision_model.cli import add_native_decision_argument, check_packed_attention
 from scripts.decision_model.targets import question_targets
 
 
@@ -109,6 +109,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data", type=Path, required=True)
+    add_native_decision_argument(parser)
     parser.add_argument("--method", choices=("lora", "full"))
     parser.add_argument("--prompt-module", type=Path)
     parser.add_argument("--attn-implementation", default="sdpa")
@@ -131,11 +132,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def validate_native_row(model, tokenizer, row, args, device):
+    import torch
+
+    from scripts.decision_model.native import NativeRows, inputs_to_device, read_logits
+
+    prepare = NativeRows(model, tokenizer, args.max_tokens, args.packed_read)
+    example = prepare(row)
+    if example is None:
+        raise ValueError("first validation prompt exceeds --max-tokens")
+    # Compare recipe grouping and option order with a direct native forward.
+    expected = {}
+    results = {}
+    with torch.inference_mode():
+        for inputs, questions in prepare.config.prepare_inputs(row["input"], tokenizer):
+            flat = model(**inputs_to_device(inputs, device)).float()
+            groups = flat.split([len(q.options) for q in questions])
+            for q, values in zip(questions, groups, strict=True):
+                expected[q.name] = (list(q.options), values)
+        for read in example["reads"]:
+            for question, logits in zip(
+                read["questions"], read_logits(read, model, device), strict=True
+            ):
+                key = question["key"]
+                labels, direct = expected.pop(key)
+                if labels != question["labels"] or not torch.isfinite(logits).all():
+                    raise ValueError(f"Invalid native readout for question {key!r}")
+                torch.testing.assert_close(logits, direct, atol=args.atol, rtol=args.rtol)
+                results[key] = {
+                    "gold": labels[question["gold"]],
+                    "prediction": labels[logits.argmax().item()],
+                    "max_logit_difference": (logits - direct).abs().max().item(),
+                }
+    if expected:
+        raise ValueError("Native readout omitted questions")
+    return results
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     import torch
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoTokenizer
 
+    from scripts.decision_model.native import load_decision_model
     from scripts.decision_model.runtime import (
         DecisionRows,
         Scorer,
@@ -147,27 +186,25 @@ def main(argv: list[str] | None = None) -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for checkpoint validation")
-    prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
-    receipt, _ = verify_receipt(args.checkpoint, method=args.method, prompt_module=prompt_module)
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True)
-    prepare = DecisionRows(tokenizer, prompt_module, args.max_tokens)
-    packed_prepare = (
-        DecisionRows(tokenizer, prompt_module, args.max_tokens, packed_read=True)
-        if args.packed_read
-        else None
+    prompt_module = (
+        None if args.native_decision else resolve_prompt_module(args.checkpoint, args.prompt_module)
     )
+    receipt, _ = verify_receipt(args.checkpoint, method=args.method, prompt_module=prompt_module)
+    if bool(receipt.get("native_decision")) != args.native_decision:
+        raise ValueError(
+            "Readout interface must match the native_decision setting in the export receipt"
+        )
+    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, trust_remote_code=True)
     with args.data.open() as handle:
         first_line = next((line for line in handle if line.strip()), None)
     if first_line is None:
         raise ValueError("validation data contains no rows")
     row = json.loads(first_line)
-    example = prepare(first_question_row(row) if args.packed_read else row)
-    if example is None:
-        raise ValueError("first validation prompt exceeds --max-tokens")
     device = torch.device("cuda", 0)
     model = (
-        AutoModel.from_pretrained(
+        load_decision_model(
             args.checkpoint,
+            native=args.native_decision,
             trust_remote_code=True,
             dtype=torch.bfloat16,
             attn_implementation=args.attn_implementation,
@@ -175,6 +212,33 @@ def main(argv: list[str] | None = None) -> None:
         .to(device)
         .eval()
     )
+    if args.native_decision:
+        if (
+            getattr(model.decision_config, "decision_attention_layout", None)
+            != receipt["decision_attention_layout"]
+        ):
+            raise ValueError("Reloaded decision layout differs from the export receipt")
+        results = validate_native_row(model, tokenizer, row, args, device)
+        print(
+            json.dumps(
+                {
+                    "method": receipt["method"],
+                    "tensor_count": receipt["tensor_count"],
+                    "questions": results,
+                },
+                indent=2,
+            )
+        )
+        return
+    prepare = DecisionRows(tokenizer, prompt_module, args.max_tokens)
+    packed_prepare = (
+        DecisionRows(tokenizer, prompt_module, args.max_tokens, packed_read=True)
+        if args.packed_read
+        else None
+    )
+    example = prepare(first_question_row(row) if args.packed_read else row)
+    if example is None:
+        raise ValueError("first validation prompt exceeds --max-tokens")
     # Compare the standard encoder entrypoint with the batched scorer used by
     # training and evaluation. This one-row check has no padding on either path.
     for layer in model.encoder.layers:

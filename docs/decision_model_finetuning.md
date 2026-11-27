@@ -1,19 +1,9 @@
 # Decision model fine-tuning with PyTorch FSDP2
 
 This recipe fine-tunes a user-supplied decision model with an explicit PyTorch loop,
-using financial-news event classification as an example. It supports native
-LoRA and decoder fine-tuning (`--method full`), uses shared FSDP2 helpers for
-both methods, and keeps the serving-time decision objective:
-
-1. Build the prompt with the serving prompt builder.
-2. Append one mask token.
-3. Run the encoder bidirectionally.
-4. Select the option-code logits from the diffusion head.
-5. Optimize hard- or soft-target cross-entropy.
-
-This repository provides the fine-tuning workflow and synthetic data examples.
-You supply the decision model checkpoint, tokenizer, custom model code, and
-serving prompt module.
+using financial-news event classification as an example. Both LoRA and full
+fine-tuning minimize cross-entropy over each question's options. You supply the
+checkpoint, tokenizer, and model code.
 
 Run the commands below from the repository root.
 
@@ -22,11 +12,34 @@ Run the commands below from the repository root.
 Use the shared [environment setup](../README.md#requirements) and
 [container](../README.md#container) from the repository README.
 
-Provide NVIDIA GPUs and your own compatible decision model checkpoint,
-tokenizer, and custom model code. The script expects `encoder.layers`,
-`encoder.norm`, a diffusion head, and a mask-token ID. Model loading uses
-`trust_remote_code=True`; use the reviewed code from an immutable checkpoint
-snapshot.
+Use NVIDIA GPUs and a reviewed, immutable checkpoint snapshot. Model loading uses
+`trust_remote_code=True`. Choose the interface your checkpoint implements.
+
+### Transformers decision interface
+
+Use `--native-decision` in place of `--prompt-module "$PROMPT_MODULE"` in the
+fine-tuning, validation, and evaluation commands below. Install the Transformers
+version required by your checkpoint, with `AutoModelForDecision` support. The
+recipe passes each row’s `input` to the checkpoint and groups its raw scores by
+question in the returned option order. For CPU inputs and a model on the same device, the call is
+
+```python
+for inputs, questions in model.decision_config.prepare_inputs(row["input"], tokenizer):
+    scores = model(**inputs)
+    per_question = scores.split([len(q.options) for q in questions])
+```
+
+The checkpoint selects its read layout and builds its attention masks. If it
+exposes `decision_attention_layout`, `--packed-read` selects
+`state_sees_no_questions` and saves that layout with the export. Each native
+forward processes one prepared sequence. A per-device batch can include several
+rows, and `--max-tokens` applies to each sequence. Standard backbones expose
+`model.layers` and `model.norm`. The checkpoint’s `save_pretrained` must
+preserve the decision configuration and template for reload.
+
+### Prompt-module interface
+
+The script expects `encoder.layers`, `encoder.norm`, a diffusion head, and a mask-token ID.
 
 The encoder also needs `embed_tokens` and `rotary_emb`; each layer's `self_attn`
 must expose `diffusion_lm` and `is_causal`. Decoder calls must match the
@@ -218,7 +231,7 @@ Other optimizer, schedule, loss, and module-target settings use the
 python -m scripts.decision_model.finetune_fsdp2 --help
 ```
 
-LoRA fine-tunes projection adapters. Full fine-tuning updates the encoder layers
+LoRA fine-tunes projection adapters. Full fine-tuning updates the backbone layers
 and final norm while keeping embeddings and the output head frozen.
 
 `--batch` is the global batch and must be divisible by the per-device batch
@@ -339,7 +352,7 @@ requires complete coverage; scoring also verifies the supplied run metadata
 against the input and prediction files. Use each script's `--help` for
 additional options.
 
-## 6. Always-packed (state-blind) training
+## 6. State-blind packing with a prompt module
 
 Some decision models serve several questions about one state in a single
 sequence: the state once, then each question followed by its own mask token.
@@ -487,4 +500,10 @@ Tests use synthetic fixtures and require no model downloads:
 python -m pytest -m "not gpu and not distributed and not slow and not requires_model"
 ```
 
-GPU-backed validation remains required before publishing the recipe.
+To exercise native full and LoRA fine-tuning, export, reload, and evaluation
+with your own checkpoint, set its local snapshot path. The test uses up to two
+visible NVIDIA GPUs and writes a full export for each method.
+
+```bash
+DECISION_CHECKPOINT=/models/decision-model python -m pytest -q tests/decision_model/test_native_checkpoint_gpu.py
+```

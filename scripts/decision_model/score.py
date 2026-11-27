@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from scripts.decision_model.checkpoint_manifest import file_sha256
-from scripts.decision_model.targets import question_definitions, question_targets, target_label
+from scripts.decision_model.targets import (
+    question_definitions,
+    question_options,
+    question_targets,
+    target_label,
+)
 
 RUN_METADATA_FIELDS = (
     "started_at",
@@ -39,6 +44,9 @@ RUN_METADATA_FIELDS = (
     "precision",
     "max_tokens",
     "packed_read",
+    "native_decision",
+    "decision_attention_layout",
+    "preparation_assets",
     "peak_allocated_gib",
     "evaluator_sha256",
     "gpus",
@@ -264,7 +272,7 @@ def score_questions(
             if not isinstance(answer, dict) or not isinstance(answer.get("probs"), dict):
                 raise ValueError(f"prediction {row_id!r} question {key!r} has no probabilities")
             question = questions[key]
-            labels = list(question["criteria"])
+            labels = question_options(question)
             target = target_label(target, question.get("type"))
             if target not in labels:
                 raise ValueError(f"reference {row_id!r} question {key!r} target {target!r} unknown")
@@ -366,13 +374,17 @@ def run_markdown_lines(run: dict[str, Any]) -> list[str]:
         if packed_read is False
         else "unknown"
     )
+    prompt_line = f"- Prompt module SHA-256: `{run.get('prompt_module_sha256', 'unknown')}`"
+    if run.get("native_decision"):
+        read_layout = run.get("decision_attention_layout") or "checkpoint default"
+        prompt_line = "- Prompt preparation: Transformers decision interface"
     return [
         "",
         "## Run provenance",
         "",
         f"- Model checkpoint: `{run.get('checkpoint', 'unknown')}`",
         f"- Model SHA-256: `{run.get('model_sha256', 'unknown')}`",
-        f"- Prompt module SHA-256: `{run.get('prompt_module_sha256', 'unknown')}`",
+        prompt_line,
         f"- Input SHA-256: `{run.get('input_sha256', 'unknown')}`",
         f"- Read layout: {read_layout}",
         f"- GPUs: {', '.join(run.get('gpus', []))}",

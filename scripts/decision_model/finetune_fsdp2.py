@@ -32,10 +32,12 @@ from torch import nn
 
 from scripts.decision_model.checkpoint_manifest import (
     file_sha256,
+    preparation_assets,
     safetensors_inventory,
     weight_manifest,
 )
-from scripts.decision_model.cli import check_packed_attention
+from scripts.decision_model.cli import add_native_decision_argument, check_packed_attention
+from scripts.decision_model.native import NativeRows, NativeScorer, load_decision_model, read_logits
 from scripts.decision_model.runtime import (
     DecisionRows,
     Scorer,
@@ -85,6 +87,7 @@ LORA_TARGETS = (
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    add_native_decision_argument(parser)
     parser.add_argument("--method", choices=("lora", "full"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-revision", default="")
@@ -341,6 +344,17 @@ class LoRALinear(nn.Module):
         return self.base(inputs) + residual * self.scaling
 
 
+def backbone_name(model: nn.Module) -> str:
+    for name in ("encoder", "model"):
+        if hasattr(getattr(model, name, None), "layers"):
+            return name
+    raise ValueError("Decision model must expose encoder.layers or model.layers")
+
+
+def decoder_layers(scorer):
+    return getattr(scorer.inner, backbone_name(scorer.inner)).layers
+
+
 def apply_lora(
     model: nn.Module,
     *,
@@ -353,11 +367,12 @@ def apply_lora(
     for parameter in model.parameters():
         parameter.requires_grad = False
 
+    prefix = f"{backbone_name(model)}.layers."
     replacements: list[tuple[str, nn.Linear]] = []
     for name, module in model.named_modules():
         if (
             isinstance(module, nn.Linear)
-            and name.startswith("encoder.layers.")
+            and name.startswith(prefix)
             and name.rsplit(".", 1)[-1] in targets
         ):
             replacements.append((name, module))
@@ -373,9 +388,10 @@ def apply_lora(
 
 def mark_full_trainable(model: nn.Module) -> list[str]:
     """Fine-tune decoder blocks and final norm; freeze embeddings and output head."""
+    backbone = backbone_name(model)
     names = []
     for name, parameter in model.named_parameters():
-        parameter.requires_grad = name.startswith(("encoder.layers.", "encoder.norm."))
+        parameter.requires_grad = name.startswith((f"{backbone}.layers.", f"{backbone}.norm."))
         if parameter.requires_grad:
             names.append(name)
     if not names:
@@ -391,7 +407,7 @@ def shard_scorer(
 ) -> Scorer:
     """Shard each decoder layer and then the scorer root."""
     if not cpu_offload:
-        layer_class = type(scorer.inner.encoder.layers[0]).__name__
+        layer_class = type(decoder_layers(scorer)[0]).__name__
         recipe_fsdp2_wrap(scorer, layer_class)
         scorer.to(device)
         scorer._fsdp2_implementation = "shared-fsdp2"  # type: ignore[attr-defined]
@@ -415,7 +431,7 @@ def shard_scorer(
                     buffer.to(device),
                     persistent=name not in module._non_persistent_buffers_set,
                 )
-    for layer in scorer.inner.encoder.layers:
+    for layer in decoder_layers(scorer):
         fully_shard(layer, **options)
     fully_shard(scorer, **options)
     scorer._fsdp2_implementation = "cpu-offload"  # type: ignore[attr-defined]
@@ -428,7 +444,7 @@ def fsdp2_inventory(scorer: Scorer) -> dict[str, int]:
     from torch.distributed.tensor import DTensor
 
     units = [module for module in scorer.modules() if isinstance(module, FSDPModule)]
-    expected_units = len(scorer.inner.encoder.layers) + 1
+    expected_units = len(decoder_layers(scorer)) + 1
     if len(units) != expected_units:
         raise RuntimeError(
             f"Expected {expected_units} FSDP2 units (root + layers), found {len(units)}"
@@ -491,7 +507,7 @@ def row_loss(example: dict, logits: torch.Tensor, kl_weight: float = 0.0) -> tor
     if target is None:
         target = F.one_hot(
             torch.tensor(example["gold"], device=logits.device),
-            len(example["cand"]),
+            logits.numel(),
         ).to(log_probs.dtype)
     return -(target * log_probs).sum()
 
@@ -505,6 +521,44 @@ def example_loss(example: dict, logits: list[torch.Tensor], kl_weight: float = 0
         for question, question_logits in zip(example["questions"], logits, strict=True)
     ]
     return torch.stack(losses).mean()
+
+
+def aligned_reads(examples, device, world):
+    """Give every FSDP rank the same forward/backward count for this microbatch."""
+    reads = [(index, read) for index, row in enumerate(examples) for read in row["reads"]]
+    count = len(reads)
+    if world > 1:
+        maximum = torch.tensor(count, device=device)
+        dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        count = int(maximum.item())
+    for index in range(count):
+        row, read = reads[min(index, len(reads) - 1)]
+        yield row, read, index < len(reads), index == count - 1
+
+
+def set_gradient_sync(scorer, synchronize):
+    scorer.set_requires_gradient_sync(synchronize)
+    if hasattr(scorer, "set_is_last_backward"):
+        scorer.set_is_last_backward(synchronize)
+
+
+def native_backward(examples, valid, scorer, device, world, valid_count, kl_weight, synchronize):
+    losses = torch.zeros(len(examples), device=device)
+    for index, read, real, last in aligned_reads(examples, device, world):
+        set_gradient_sync(scorer, synchronize and last)
+        logits = read_logits(read, scorer, device)
+        contribution = torch.stack(
+            [
+                row_loss(q, values, kl_weight)
+                for q, values in zip(read["questions"], logits, strict=True)
+            ]
+        ).sum() / len(examples[index]["questions"])
+        if real and valid[index]:
+            losses[index] += contribution.detach()
+        else:
+            contribution = contribution * 0
+        (contribution * (world / valid_count)).backward()
+    return losses
 
 
 def learning_rate(step: int, total: int, peak: float, warmup: float) -> float:
@@ -538,7 +592,7 @@ def merge_lora_state_dict(
 
 
 def resume_signature(
-    args: argparse.Namespace, world: int, total_steps: int, prompt_module: Path
+    args: argparse.Namespace, world: int, total_steps: int, prompt_module: Path | None
 ) -> dict:
     """Fingerprint inputs and settings that determine optimizer/data continuity."""
     keys = (
@@ -575,17 +629,15 @@ def resume_signature(
         model = {
             "weights": identity["sha256"],
             "index": identity["index_sha256"],
-            "assets": {
-                file.relative_to(checkpoint).as_posix(): file_sha256(file)
-                for file in sorted(checkpoint.rglob("*"))
-                if file.is_file() and file.suffix in {".json", ".py", ".model", ".tiktoken", ".txt"}
-            },
+            "assets": preparation_assets(checkpoint, native=prompt_module is None),
         }
     else:
         if not args.model_revision:
             raise ValueError("Hub checkpoints require --model-revision for reproducible resume")
         model = {"id": args.checkpoint, "revision": args.model_revision}
     settings = {key: getattr(args, key) for key in keys}
+    if prompt_module is None:
+        settings["native_decision"] = True
     if getattr(args, "packed_read", False):
         settings["packed_read"] = True
     if getattr(args, "packed_attention", "dense") != "dense":
@@ -596,7 +648,7 @@ def resume_signature(
         "total_steps": total_steps,
         "train_sha256": file_sha256(Path(args.train)),
         "eval_sha256": file_sha256(Path(args.eval)) if args.eval else None,
-        "prompt_module_sha256": file_sha256(prompt_module),
+        "prompt_module_sha256": file_sha256(prompt_module) if prompt_module else None,
         "model": model,
     }
 
@@ -615,6 +667,12 @@ def read_resume_state(checkpoint: str | Path, expected: dict) -> dict:
     if state.get("best_saved"):
         best = Path(checkpoint) / "best"
         receipt = json.loads((best / "pure-pytorch-receipt.json").read_text())
+        if expected.get("settings", {}).get("native_decision"):
+            from scripts.decision_model.validate_checkpoint import verify_export_checksums
+
+            if not (best / "SHA256SUMS").is_file():
+                raise ValueError("Saved native checkpoint lacks SHA256SUMS")
+            verify_export_checksums(best)
         manifest = weight_manifest(best)
         if manifest["sha256"] != receipt.get("model_sha256"):
             raise ValueError("Saved best checkpoint does not match its weight manifest")
@@ -699,7 +757,7 @@ def gather_full_export_state(
     """Gather parameters and persistent buffers, then restore sharded storage."""
     from torch.distributed.fsdp import FSDPModule
 
-    units = [*scorer.inner.encoder.layers, scorer]
+    units = [*decoder_layers(scorer), scorer]
     if not all(isinstance(unit, FSDPModule) for unit in units):
         raise RuntimeError("Expected every export unit to be an FSDP2 module")
     materialized = []
@@ -776,7 +834,7 @@ def export_checkpoint(
     method: str,
     lora_scaling: float,
     rank: int,
-    prompt_module: Path,
+    prompt_module: Path | None,
     drop_config_keys: list[str],
     packed_read: bool,
     packed_attention: str,
@@ -842,7 +900,21 @@ def export_checkpoint(
         for key in drop_config_keys:
             configuration.pop(key, None)
         (staging / "config.json").write_text(json.dumps(configuration, indent=2) + "\n")
-        shutil.copy2(prompt_module, staging / "decision_prompt.py")
+        if prompt_module is None:
+            interface = {
+                "native_decision": True,
+                "decision_attention_layout": getattr(
+                    scorer.inner.decision_config, "decision_attention_layout", None
+                ),
+            }
+            prompt_receipt = {}
+        else:
+            shutil.copy2(prompt_module, staging / "decision_prompt.py")
+            interface = {"packed_attention": packed_attention, "packed_read": packed_read}
+            prompt_receipt = {
+                "prompt_module": "decision_prompt.py",
+                "prompt_module_sha256": file_sha256(staging / "decision_prompt.py"),
+            }
         manifest = weight_manifest(staging)
         (staging / "SOURCE.json").write_text(
             json.dumps(
@@ -851,8 +923,7 @@ def export_checkpoint(
                     "derived_from": source,
                     "source_revision": source_revision or None,
                     "method": method,
-                    "packed_read": packed_read,
-                    "packed_attention": packed_attention,
+                    **interface,
                     "merged_model_sha256": manifest["sha256"],
                     "code_commit": os.environ.get("CODE_COMMIT", "unknown"),
                 },
@@ -868,8 +939,7 @@ def export_checkpoint(
                     "source_revision": source_revision or None,
                     "trainer": "scripts/decision_model/finetune_fsdp2.py",
                     "code_commit": os.environ.get("CODE_COMMIT", "unknown"),
-                    "packed_read": packed_read,
-                    "packed_attention": packed_attention,
+                    **interface,
                     "fsdp2": True,
                     "state_dict_implementation": state_dict_implementation,
                     "tensor_count": len(state),
@@ -877,8 +947,7 @@ def export_checkpoint(
                     "model_sha256": manifest["sha256"],
                     "index_sha256": manifest["index_sha256"],
                     "weight_files": manifest["files"],
-                    "prompt_module": "decision_prompt.py",
-                    "prompt_module_sha256": file_sha256(staging / "decision_prompt.py"),
+                    **prompt_receipt,
                     "dropped_config_keys": drop_config_keys,
                     "torch": torch.__version__,
                     "cuda": torch.version.cuda,
@@ -908,7 +977,7 @@ def _run(argv: list[str] | None = None) -> None:
         f"/tmp/hf-modules-{job_id}-{local_rank}",
     )
     import transformers
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoTokenizer
 
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -951,10 +1020,26 @@ def _run(argv: list[str] | None = None) -> None:
     if args.model_revision:
         pretrained_kwargs["revision"] = args.model_revision
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, **pretrained_kwargs)
-    prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
-    prepare = DecisionRows(
-        tokenizer, prompt_module, args.max_tokens, **packed_options(args.packed_read)
-    )
+
+    def load_model():
+        return load_decision_model(
+            args.checkpoint,
+            native=args.native_decision,
+            dtype=torch.bfloat16 if args.method == "lora" else torch.float32,
+            attn_implementation=args.attn_implementation,
+            **pretrained_kwargs,
+        )
+
+    if args.native_decision:
+        prompt_module = None
+        model = load_model()
+        prepare = NativeRows(model, tokenizer, args.max_tokens, args.packed_read)
+        scorer = NativeScorer(model)
+    else:
+        prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)
+        prepare = DecisionRows(
+            tokenizer, prompt_module, args.max_tokens, **packed_options(args.packed_read)
+        )
     rows = read_jsonl(args.train)
     source_train_rows = len(rows)
     if args.train_limit:
@@ -985,17 +1070,13 @@ def _run(argv: list[str] | None = None) -> None:
             flush=True,
         )
 
-    load_dtype = torch.bfloat16 if args.method == "lora" else torch.float32
-    model = AutoModel.from_pretrained(
-        args.checkpoint,
-        dtype=load_dtype,
-        attn_implementation=args.attn_implementation,
-        **pretrained_kwargs,
-    )
+    if not args.native_decision:
+        model = load_model()
+        scorer = Scorer(model)
+        mask_id = int(model.mask_token_id)
+        configure_attention_implementation(model, args.attn_implementation)
+        enable_bidirectional(model)
     expected_shapes = {name: tuple(value.shape) for name, value in model.state_dict().items()}
-    mask_id = int(model.mask_token_id)
-    configure_attention_implementation(model, args.attn_implementation)
-    enable_bidirectional(model)
     if not args.no_grad_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -1026,7 +1107,7 @@ def _run(argv: list[str] | None = None) -> None:
             f"{args.expected_trainable_parameters}, found {trainable_parameter_count}"
         )
 
-    scorer = shard_scorer(Scorer(model), cpu_offload=args.cpu_offload, device=device)
+    scorer = shard_scorer(scorer, cpu_offload=args.cpu_offload, device=device)
     fsdp2 = fsdp2_inventory(scorer)
     parameters = [parameter for parameter in scorer.parameters() if parameter.requires_grad]
     if not parameters:
@@ -1052,6 +1133,13 @@ def _run(argv: list[str] | None = None) -> None:
         return [[value] for value in logits]
 
     def option_logits(example: dict) -> list[torch.Tensor]:
+        if args.native_decision:
+            output = []
+            for _, read, real, _ in aligned_reads([example], device, world):
+                logits = read_logits(read, scorer, device)
+                if real:
+                    output.extend(logits)
+            return output
         return question_logits([example])[0]
 
     def validate(step: int) -> dict | None:
@@ -1120,6 +1208,15 @@ def _run(argv: list[str] | None = None) -> None:
         raise SystemExit(f"Resume step {start_step} exceeds total steps {total_steps}")
     config = {
         **vars(args),
+        **(
+            {
+                "decision_attention_layout": getattr(
+                    model.decision_config, "decision_attention_layout", None
+                )
+            }
+            if args.native_decision
+            else {}
+        ),
         "world_size": world,
         "total_steps": total_steps,
         "start_step": start_step,
@@ -1230,9 +1327,22 @@ def _run(argv: list[str] | None = None) -> None:
                 examples.append(example)
 
             synchronize = microstep == microsteps - 1
-            scorer.set_requires_gradient_sync(synchronize)
-            if hasattr(scorer, "set_is_last_backward"):
-                scorer.set_is_last_backward(synchronize)
+            if args.native_decision:
+                losses.extend(
+                    native_backward(
+                        examples,
+                        local_valid,
+                        scorer,
+                        device,
+                        world,
+                        valid_count,
+                        args.kl_weight,
+                        synchronize,
+                    )
+                )
+                valid_flags.extend(local_valid)
+                continue
+            set_gradient_sync(scorer, synchronize)
             logits = question_logits(examples)
             micro_losses = [
                 example_loss(example, example_logits, args.kl_weight)

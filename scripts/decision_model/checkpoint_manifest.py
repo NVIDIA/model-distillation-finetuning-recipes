@@ -19,6 +19,19 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def preparation_assets(
+    checkpoint: Path, *, native: bool = False, exclude: Path | None = None
+) -> dict[str, str]:
+    extensions = {".json", ".py", ".model", ".tiktoken", ".txt"}
+    if native:
+        extensions.add(".jinja")
+    return {
+        path.relative_to(checkpoint).as_posix(): file_sha256(path)
+        for path in sorted(checkpoint.rglob("*"))
+        if path.suffix in extensions and exclude not in path.parents and path.is_file()
+    }
+
+
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
     result = {}
     for key, value in pairs:

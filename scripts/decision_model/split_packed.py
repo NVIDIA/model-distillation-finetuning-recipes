@@ -7,7 +7,12 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 
-from scripts.decision_model.targets import question_definitions, question_targets, target_label
+from scripts.decision_model.targets import (
+    question_definitions,
+    question_options,
+    question_targets,
+    target_label,
+)
 
 
 def row_labels(row: dict) -> list[tuple[str, str]]:
@@ -19,7 +24,7 @@ def row_labels(row: dict) -> list[tuple[str, str]]:
     for key, value in targets.items():
         question = questions[key]
         label = target_label(value, question.get("type"))
-        if label not in question["criteria"]:
+        if label not in question_options(question):
             raise ValueError(f"row {row.get('id')!r} question {key!r} has unknown target {label!r}")
         labels.append((key, label))
     return labels
