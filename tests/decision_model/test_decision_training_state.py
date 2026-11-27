@@ -425,6 +425,42 @@ def cpu_training(monkeypatch):
     return model
 
 
+def test_packed_validation_log_counts_rows_and_averages_over_questions(
+    training_inputs, cpu_training, tmp_path, monkeypatch
+):
+    class PackedRows(SyntheticRows):
+        def __init__(self, tokenizer, prompt_module, max_tokens, packed_read):
+            super().__init__(tokenizer, prompt_module, max_tokens)
+            assert packed_read
+
+        def __call__(self, row, shuffle_seed=None):
+            question = super().__call__(row)
+            questions = [dict(question, gold=gold) for gold in row.get("golds", [0])]
+            return {"packed": True, "state": [1], "questions": questions}
+
+    def packed_logits(examples, scorer, **kwargs):
+        if scorer.training:
+            logits = training.batched_option_logits(examples, scorer, **kwargs)
+            return [[value] * len(row["questions"]) for value, row in zip(logits, examples)]
+        return [[torch.tensor([3.0, 1.0]).log() for _ in row["questions"]] for row in examples]
+
+    monkeypatch.setattr(training, "DecisionRows", PackedRows)
+    monkeypatch.setattr(training, "packed_option_logits", packed_logits)
+    training_inputs.validation.write_text(
+        '{"id":"state-a","golds":[0,0]}\n{"id":"state-b","golds":[1]}\n'
+    )
+    output = tmp_path / "packed"
+    training.main([*command(training_inputs, output), "--packed-read"])
+    records = [json.loads(line) for line in (output / "validation.jsonl").read_text().splitlines()]
+    assert records
+    for record in records:
+        assert (record["rows"], record["questions"]) == (2, 3)
+        assert record["accuracy"] == pytest.approx(2 / 3)
+        assert record["cross_entropy"] == pytest.approx(
+            -torch.tensor([0.75, 0.75, 0.25]).log().mean().item()
+        )
+
+
 def test_main_cleans_up_after_batch_configuration_failure(training_inputs, cpu_training, tmp_path):
     argv = command(training_inputs, tmp_path / "invalid-batch")
     argv[argv.index("--batch") + 1] = "3"

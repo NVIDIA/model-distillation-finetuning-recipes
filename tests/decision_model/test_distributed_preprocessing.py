@@ -128,10 +128,7 @@ def run_distributed(
         nprocs=world,
         join=True,
     )
-    return [
-        json.loads((result_dir / f"{rank}.json").read_text())
-        for rank in range(world)
-    ]
+    return [json.loads((result_dir / f"{rank}.json").read_text()) for rank in range(world)]
 
 
 @pytest.mark.parametrize(
@@ -164,10 +161,9 @@ def test_four_process_metadata_and_assignments_match_sequential(tmp_path, rows):
     assert all(result["usable"] == expected_usable for result in results)
     assert len({result["metadata_digest"] for result in results}) == 1
     assert len({result["order_digest"] for result in results}) == 1
-    assert [
-        result["local_assignment"]
-        for result in results
-    ] == [expected_order[:8][rank::4] for rank in range(4)]
+    assert [result["local_assignment"] for result in results] == [
+        expected_order[:8][rank::4] for rank in range(4)
+    ]
 
 
 def test_distributed_failures_report_globally_earliest_row_without_hanging(tmp_path):
@@ -181,9 +177,7 @@ def test_distributed_failures_report_globally_earliest_row_without_hanging(tmp_p
     results = run_distributed(tmp_path, rows, failure=True)
 
     messages = {result["error"] for result in results}
-    assert messages == {
-        "Training row 1 preprocessing failed with builtins.ValueError: earliest"
-    }
+    assert messages == {"Training row 1 preprocessing failed with builtins.ValueError: earliest"}
 
 
 def test_distributed_row_count_mismatch_fails_before_metadata_exchange(tmp_path):

@@ -28,6 +28,7 @@ runtime = [
     "datasets==5.0.1",
     "peft==0.21.0",
     "safetensors==0.8.0",
+    "scipy>=1.9",
     "torch>=2.6",
     "transformers>=5.6.0",
 ]
@@ -38,6 +39,7 @@ dev = [
     "pytest>=7",
     "ruff",
     "safetensors==0.8.0",
+    "scipy>=1.9",
     "torch>=2.6",
     "transformers>=5.6.0",
 ]
@@ -80,4 +82,5 @@ quote-style = "preserve"
 "scripts/decision_model/evaluate.py" = ["TRY004"]
 "scripts/decision_model/score.py" = ["TRY004"]
 "scripts/decision_model/split_data.py" = ["TRY004"]
+"scripts/decision_model/targets.py" = ["TRY004"]
 "scripts/decision_model/validate_checkpoint.py" = ["TRY004"]

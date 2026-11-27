@@ -23,6 +23,7 @@ separately under their respective licenses:
 - [`datasets`](https://github.com/huggingface/datasets) — Apache-2.0.
 - [`peft`](https://github.com/huggingface/peft) — Apache-2.0.
 - [`safetensors`](https://github.com/huggingface/safetensors) — Apache-2.0.
+- [`scipy`](https://github.com/scipy/scipy) — BSD-3-Clause.
 - [`torch`](https://github.com/pytorch/pytorch) — BSD-3-Clause for the PyTorch
   project; distributions include third-party components under additional
   licenses.

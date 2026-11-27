@@ -18,6 +18,8 @@ from scripts.decision_model.checkpoint_manifest import (
     safetensors_inventory,
     weight_manifest,
 )
+from scripts.decision_model.cli import check_packed_attention
+from scripts.decision_model.targets import question_targets
 
 
 def verify_export_checksums(checkpoint: Path) -> None:
@@ -89,15 +91,17 @@ def first_question_row(row: dict[str, Any]) -> dict[str, Any]:
     """One-question view of a row: a multi-question row keeps its first question."""
     reference = row.get("reference") if isinstance(row, dict) else None
     payload = row.get("input") if isinstance(row, dict) else None
-    targets = reference.get("targets") if isinstance(reference, dict) else None
     questions = payload.get("questions") if isinstance(payload, dict) else None
-    if not isinstance(targets, dict) or not isinstance(questions, dict) or not questions:
+    if not isinstance(reference, dict) or "targets" not in reference:
         return row
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("Decision rows must contain at least one input question")
+    targets = question_targets(row, questions)
     key = next(iter(questions))
     return {
         **row,
         "input": {**payload, "questions": {key: questions[key]}},
-        "reference": {"target": targets.get(key)},
+        "reference": {"target": targets[key]},
     }
 
 
@@ -117,6 +121,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=0.02)
     parser.add_argument("--rtol", type=float, default=0.01)
     args = parser.parse_args(argv)
+    check_packed_attention(parser, args)
     if args.max_tokens < 1:
         parser.error("--max-tokens must be positive")
     for name in ("atol", "rtol"):
@@ -127,6 +132,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     import torch
     from transformers import AutoModel, AutoTokenizer
 
@@ -139,7 +145,6 @@ def main(argv: list[str] | None = None) -> None:
         resolve_prompt_module,
     )
 
-    args = parse_args(argv)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for checkpoint validation")
     prompt_module = resolve_prompt_module(args.checkpoint, args.prompt_module)

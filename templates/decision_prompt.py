@@ -7,8 +7,8 @@ Copy this file to your own decision_prompt.py, then:
 1. Set OPTION_CODES to your model's serving option codes, in positional order.
 2. Implement _prompt_token_ids with your model's serving format and tokenization.
 3. For --packed-read, set STATE_END_TOKEN to your model's state separator.
-   Every question about the same state must share the same token IDs up to
-   and including that token.
+   It must be a known token and occur exactly once per prompt. Every question
+   about the same state must share the token IDs up to and including it.
 
 Keep prompt helpers in this file so it can load from an exported checkpoint.
 See examples/decision_model/prompt_module.py for a synthetic implementation.

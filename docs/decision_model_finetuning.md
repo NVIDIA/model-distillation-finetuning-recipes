@@ -364,7 +364,8 @@ and evaluation are unchanged.
 
 Set `STATE_END_TOKEN` to the special token your decision model uses to mark
 the end of the state. Your prompt module returns its ID from
-`state_end_token_id(tokenizer)`. Every question about the same state must
+`state_end_token_id(tokenizer)`. The token must occur exactly once in each
+prepared prompt. Every question about the same state must
 share the same token IDs up to and including this token. The
 [template](../templates/decision_prompt.py) and the
 [synthetic example](../examples/decision_model/prompt_module.py) include both.
@@ -379,8 +380,17 @@ question key:
 {"id":"news-007","input":{"state":"Example Corp acquired Sample Labs.","questions":{"event":{"type":"choice","instructions":"Which event best describes this headline?","criteria":{"acquisition":"One company buys another.","other":"None of the listed events."}},"sector":{"type":"choice","instructions":"Which sector is the buyer in?","criteria":{"technology":"Software or hardware.","finance":"Banking or payments."}}}},"reference":{"targets":{"event":"acquisition","sector":"technology"}}}
 ```
 
-`soft_labels` apply to one-question rows. A row whose packed sequence exceeds
+Use exactly one target format per row. `soft_labels` apply to one-question
+rows with `reference.target`. A row whose packed sequence exceeds
 `--max-tokens` is excluded, as in section 2.
+
+Run the split command from section 1 on the complete labeled JSONL. When any
+row uses `reference.targets`, it groups rows with the same `input.state` and
+uses SciPy to assign whole states to train, validation, and test. It balances
+row and question-label counts toward the requested fractions. Each observed
+question-label pair must occur in at least three distinct states. If their
+overlap makes full coverage impossible, splitting fails before writing the
+outputs. The split metadata records row counts and per-question label counts.
 
 ### Commands
 
@@ -419,9 +429,13 @@ python -m scripts.decision_model.evaluate \
 With `--packed-read`, the validator also reads the first validation row packed
 and reports its prediction for every question.
 
+The trainer logs both `rows` and `questions` in `validation.jsonl`.
+Validation accuracy and cross-entropy are averaged over questions.
+
 ### Optional FlexAttention backend
 
-Packed training uses a dense token-pair mask by default. On PyTorch builds with
+Packed reads use SDPA with a dense token-pair mask by default. FlashAttention 2
+cannot represent this mask. On PyTorch builds with
 FlexAttention support, the equivalent block mask avoids carrying a dense
 additive mask through every attention layer:
 

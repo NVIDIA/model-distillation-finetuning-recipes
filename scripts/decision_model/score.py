@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.decision_model.checkpoint_manifest import file_sha256
+from scripts.decision_model.targets import question_definitions, question_targets, target_label
 
 RUN_METADATA_FIELDS = (
     "started_at",
@@ -233,44 +234,6 @@ def has_question_targets(references: list[dict[str, Any]]) -> bool:
     )
 
 
-def question_definitions(reference: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Validated input questions keyed as they must appear in targets and predictions."""
-    payload = reference.get("input")
-    questions = payload.get("questions") if isinstance(payload, dict) else None
-    if not isinstance(questions, dict) or not questions:
-        raise ValueError(f"reference {reference.get('id')!r} has invalid input.questions")
-    for key, question in questions.items():
-        if not isinstance(key, str) or not key or not isinstance(question, dict):
-            raise ValueError(f"reference {reference.get('id')!r} has invalid input.questions")
-        criteria = question.get("criteria")
-        labels = list(criteria) if isinstance(criteria, dict) else []
-        if (
-            len(labels) < 2
-            or any(not isinstance(label, str) or not label for label in labels)
-            or len(labels) != len(set(labels))
-        ):
-            raise ValueError(
-                f"reference {reference.get('id')!r} question {key!r} "
-                "needs at least two unique non-empty criteria labels"
-            )
-    return questions
-
-
-def question_targets(
-    reference: dict[str, Any], questions: dict[str, dict[str, Any]]
-) -> dict[str, Any]:
-    """Targets by question key: reference.targets, or the one question's target."""
-    section = reference.get("reference")
-    targets = section.get("targets") if isinstance(section, dict) else None
-    if targets is None:
-        if len(questions) != 1 or not isinstance(section, dict) or "target" not in section:
-            raise ValueError(f"reference {reference.get('id')!r} lacks reference.targets")
-        return {next(iter(questions)): section["target"]}
-    if not isinstance(targets, dict) or set(targets) != set(questions):
-        raise ValueError(f"reference {reference.get('id')!r} has invalid reference.targets")
-    return targets
-
-
 def score_questions(
     references: list[dict[str, Any]],
     predictions_by_id: dict[str, dict[str, Any]],
@@ -302,7 +265,7 @@ def score_questions(
                 raise ValueError(f"prediction {row_id!r} question {key!r} has no probabilities")
             question = questions[key]
             labels = list(question["criteria"])
-            target = str(target).lower() if question.get("type") == "noul" else str(target)
+            target = target_label(target, question.get("type"))
             if target not in labels:
                 raise ValueError(f"reference {row_id!r} question {key!r} target {target!r} unknown")
             probabilities = normalized_probabilities({**answer, "id": row_id}, labels)

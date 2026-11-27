@@ -14,7 +14,9 @@ import tempfile
 from collections import Counter, defaultdict
 from contextlib import ExitStack
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, TypeVar
+
+from scripts.decision_model import split_packed
 
 
 def file_sha256(path: Path) -> str:
@@ -25,12 +27,17 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def row_identity(row: object, *, line_number: int) -> tuple[str, str]:
+def _row_id(row: object, line_number: int) -> str:
     if not isinstance(row, dict):
         raise ValueError(f"line {line_number}: row must be an object")
     row_id = row.get("id")
     if not isinstance(row_id, str) or not row_id:
         raise ValueError(f"line {line_number}: id must be a non-empty string")
+    return row_id
+
+
+def row_identity(row: object, *, line_number: int) -> tuple[str, str]:
+    row_id = _row_id(row, line_number)
     reference = row.get("reference")
     target = reference.get("target") if isinstance(reference, dict) else None
     if not isinstance(target, str) or not target:
@@ -55,17 +62,30 @@ def read_rows(path: Path):
             yield line_number, text, row
 
 
-def _count_labels(input_path: Path) -> tuple[Counter[str], int]:
+def _count_labels(input_path: Path) -> tuple[Counter[str], int] | None:
+    """Count scalar labels, or switch to joint stratification on the first mapped reference."""
     counts: Counter[str] = Counter()
     seen_ids: set[str] = set()
     rows = 0
+    scalar_error = None
     for line_number, _, row in read_rows(input_path):
-        row_id, target = row_identity(row, line_number=line_number)
+        reference = row.get("reference") if isinstance(row, dict) else None
+        if isinstance(reference, dict) and "targets" in reference:
+            return None
+        # A later mapped reference selects packed parsing for the whole file,
+        # including earlier scalar targets (e.g. boolean answers).
+        try:
+            row_id, target = row_identity(row, line_number=line_number)
+        except ValueError as error:
+            scalar_error = scalar_error or str(error)
+            continue
         if row_id in seen_ids:
             raise ValueError(f"{input_path}:{line_number}: duplicate id {row_id!r}")
         seen_ids.add(row_id)
         counts[target] += 1
         rows += 1
+    if scalar_error:
+        raise ValueError(scalar_error)
     if rows < 3:
         raise ValueError("input must contain at least three rows")
     return counts, rows
@@ -115,8 +135,11 @@ def _select_holdout_ids(
     return validation_ids, test_ids
 
 
+Label = TypeVar("Label", str, tuple[str, str])
+
+
 def _check_stratification(
-    quotas: dict[str, dict[str, int]], counts: dict[str, Counter[str]]
+    quotas: dict[str, dict[Label, int]], counts: dict[str, Counter[Label]]
 ) -> None:
     for split, expected in quotas.items():
         if dict(counts[split]) != expected:
@@ -163,13 +186,23 @@ def split_file(
         )
 
     source_sha = file_sha256(input_path)
-    label_counts, input_rows = _count_labels(input_path)
-    quotas = _split_quotas(label_counts, validation_fraction, test_fraction)
-    validation_ids, test_ids = _select_holdout_ids(input_path, quotas, seed)
+    scalar_counts = _count_labels(input_path)
+    packed = scalar_counts is None
+    if scalar_counts is None:
+        rows = ((_row_id(row, n), row) for n, _, row in read_rows(input_path))
+        validation_ids, test_ids, quotas, input_rows = split_packed.plan(
+            rows, validation_fraction, test_fraction, seed
+        )
+        label_counts = sum((Counter(counts) for counts in quotas.values()), Counter())
+    else:
+        label_counts, input_rows = scalar_counts
+        quotas = _split_quotas(label_counts, validation_fraction, test_fraction)
+        validation_ids, test_ids = _select_holdout_ids(input_path, quotas, seed)
     if validation_ids & test_ids:
         raise ValueError("validation and test splits must not overlap")
 
-    counts: dict[str, Counter[str]] = {split: Counter() for split in outputs}
+    counts = {split: Counter() for split in outputs}
+    row_counts = Counter()
     staged: dict[str, Path] = {}
     temporaries: list[Path] = []
     try:
@@ -181,7 +214,12 @@ def split_file(
                 temporaries.append(temporary)
                 handles[split] = stack.enter_context(handle)
             for line_number, text, row in read_rows(input_path):
-                row_id, target = row_identity(row, line_number=line_number)
+                if packed:
+                    row_id = _row_id(row, line_number)
+                    labels = split_packed.row_labels(row)
+                else:
+                    row_id, target = row_identity(row, line_number=line_number)
+                    labels = [target]
                 if row_id in validation_ids:
                     split = "validation"
                 elif row_id in test_ids:
@@ -189,10 +227,12 @@ def split_file(
                 else:
                     split = "train"
                 handles[split].write(text if text.endswith("\n") else text + "\n")
-                counts[split][target] += 1
+                counts[split].update(labels)
+                row_counts[split] += 1
         if file_sha256(input_path) != source_sha:
             raise ValueError("input changed during splitting; outputs were not accepted")
         _check_stratification(quotas, counts)
+        count_field = "question_label_counts" if packed else "label_counts"
         summary: dict[str, object] = {
             "input": str(input_path),
             "input_sha256": source_sha,
@@ -201,13 +241,19 @@ def split_file(
             "test_fraction": test_fraction,
             "seed": seed,
             "stratified": True,
-            "label_counts": dict(sorted(label_counts.items())),
+            count_field: split_packed.question_counts(label_counts)
+            if packed
+            else dict(sorted(label_counts.items())),
         }
         for split, path in outputs.items():
             summary[f"{split}_output"] = str(path)
             summary[f"{split}_sha256"] = file_sha256(staged[split])
-            summary[f"{split}_rows"] = sum(counts[split].values())
-            summary[f"{split}_label_counts"] = dict(sorted(counts[split].items()))
+            summary[f"{split}_rows"] = row_counts[split]
+            summary[f"{split}_{count_field}"] = (
+                split_packed.question_counts(counts[split])
+                if packed
+                else dict(sorted(counts[split].items()))
+            )
         metadata_tmp, metadata_handle = _open_temporary(metadata_path)
         temporaries.append(metadata_tmp)
         with metadata_handle:

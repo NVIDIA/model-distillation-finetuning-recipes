@@ -27,6 +27,8 @@ from types import ModuleType
 import torch
 from torch import nn
 
+from scripts.decision_model.targets import question_targets, target_label
+
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 except ImportError:  # pragma: no cover - exercised only by older PyTorch releases
@@ -109,6 +111,8 @@ class DecisionRows:
             token = state_end(tokenizer)
             if isinstance(token, bool) or not isinstance(token, int) or token < 0:
                 raise ValueError("state_end_token_id must return a non-negative token ID")
+            if token == getattr(tokenizer, "unk_token_id", None):
+                raise ValueError("The state-end token must be known to the tokenizer")
             self.state_end_id = token
 
     def __call__(self, row: dict, shuffle_seed: int | None = None) -> dict | None:
@@ -120,8 +124,8 @@ class DecisionRows:
         questions = payload.get("questions") if isinstance(payload, dict) else None
         if not isinstance(questions, dict) or len(questions) != 1:
             raise ValueError("Decision rows must contain exactly one input question")
-        reference = row.get("reference")
-        if not isinstance(reference, dict) or "target" not in reference:
+        targets = question_targets(row, questions)
+        if "target" not in row["reference"]:
             raise ValueError("Decision row lacks reference.target")
         permutation = None
         if shuffle_seed is not None:
@@ -139,7 +143,7 @@ class DecisionRows:
         )
         if not isinstance(prepared, (list, tuple)) or len(prepared) != 1:
             raise ValueError("Prompt module must return exactly one prepared question")
-        example = self._question(prepared[0], reference["target"], row.get("soft_labels"))
+        example = self._question(prepared[0], next(iter(targets.values())), row.get("soft_labels"))
         if len(example["ids"]) + 1 > self.max_tokens:
             return None
         return example
@@ -156,7 +160,7 @@ class DecisionRows:
         labels = list(labels)
         if len(labels) < 2 or len(set(labels)) != len(labels):
             raise ValueError("Decision labels must contain at least two unique labels")
-        gold = str(gold).lower() if kind == "noul" else str(gold)
+        gold = target_label(gold, kind)
         if gold not in labels:
             raise ValueError(f"Unknown decision target: {gold!r}")
         if (
@@ -209,21 +213,11 @@ class DecisionRows:
         questions = payload.get("questions") if isinstance(payload, dict) else None
         if not isinstance(questions, dict) or not questions:
             raise ValueError("Decision rows must contain at least one input question")
-        reference = row.get("reference")
-        if not isinstance(reference, dict):
-            raise ValueError("Decision row lacks reference")
+        targets = question_targets(row, questions)
         soft = row.get("soft_labels")
-        multi = not (len(questions) == 1 and "target" in reference)
-        if not multi:
-            targets = {next(iter(questions)): reference["target"]}
-            softs = {next(iter(questions)): soft}
-        else:
-            targets = reference.get("targets")
-            if not isinstance(targets, dict) or set(targets) != set(questions):
-                raise ValueError("Packed rows need reference.targets for every question key")
-            if soft is not None:
-                raise ValueError("soft_labels apply only to one-question rows")
-            softs = {}
+        multi = "targets" in row["reference"]
+        if multi and soft is not None:
+            raise ValueError("soft_labels apply only to one-question rows with reference.target")
         permutation = None
         if shuffle_seed is not None:
 
@@ -244,8 +238,7 @@ class DecisionRows:
         if sorted(map(str, keys)) != sorted(map(str, questions)) or len(set(keys)) != len(keys):
             raise ValueError("Prepared question keys must match the input questions")
         examples = [
-            dict(self._question(item, targets[item[0]], softs.get(item[0])), key=item[0])
-            for item in prepared
+            dict(self._question(item, targets[item[0]], soft), key=item[0]) for item in prepared
         ]
         state_length = packed_state_length(
             [example["ids"] for example in examples], self.state_end_id
@@ -269,8 +262,8 @@ def packed_state_length(prompts: list[list[int]], state_end_id: int) -> int:
     """Length of the shared state: every prompt up to and including state_end_id."""
     lengths = set()
     for ids in prompts:
-        if state_end_id not in ids:
-            raise ValueError("Packed reads need the state-end token in every prompt")
+        if ids.count(state_end_id) != 1:
+            raise ValueError("Packed reads require exactly one state-end token per prompt")
         lengths.add(ids.index(state_end_id) + 1)
     if len(lengths) != 1:
         raise ValueError("Packed questions must share one state boundary")
@@ -469,9 +462,7 @@ class Scorer(nn.Module):
                     device=input_ids.device,
                     dtype=hidden.dtype,
                 )
-                additive_mask.masked_fill_(
-                    ~allowed[:, None].bool(), torch.finfo(hidden.dtype).min
-                )
+                additive_mask.masked_fill_(~allowed[:, None].bool(), torch.finfo(hidden.dtype).min)
         elif attention_mask is not None:
             additive_mask = torch.zeros(
                 (input_ids.shape[0], 1, 1, sequence_length),

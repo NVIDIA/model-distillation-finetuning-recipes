@@ -15,7 +15,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN python -m venv --system-site-packages /opt/composite-venv \
     && /opt/composite-venv/bin/python -m pip install \
-       "wandb==0.30.0" "datasets==5.0.1" "transformers>=5.6.0" "safetensors==0.8.0" \
+       "wandb==0.30.0" "datasets==5.0.1" "transformers>=5.6.0" "safetensors==0.8.0" "scipy>=1.9" \
     && /opt/composite-venv/bin/python -m pip install --no-deps \
        "peft==0.21.0" "accelerate==1.15.0" \
     && if [ "${INSTALL_MAMBA_KERNELS}" = "1" ]; then \

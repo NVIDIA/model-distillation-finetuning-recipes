@@ -35,6 +35,7 @@ from scripts.decision_model.checkpoint_manifest import (
     safetensors_inventory,
     weight_manifest,
 )
+from scripts.decision_model.cli import check_packed_attention
 from scripts.decision_model.runtime import (
     DecisionRows,
     Scorer,
@@ -221,6 +222,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--drop-config-key must name a non-empty top-level configuration key")
     if args.packed_attention == "flex" and not args.packed_read:
         parser.error("--packed-attention flex requires --packed-read")
+    check_packed_attention(parser, args)
     if args.packed_attention == "flex" and args.attn_implementation != "flex_attention":
         parser.error("--packed-attention flex requires --attn-implementation flex_attention")
     for option in ("expected_lora_modules", "expected_trainable_parameters"):
@@ -242,10 +244,13 @@ def canonical_training_metadata(
     group=None,
 ) -> tuple[list[int], list[int]]:
     """Return canonical lengths and usable row indices on every rank."""
-    distributed = all(
-        hasattr(dist, name)
-        for name in ("is_initialized", "get_world_size", "get_rank", "all_reduce")
-    ) and dist.is_initialized()
+    distributed = (
+        all(
+            hasattr(dist, name)
+            for name in ("is_initialized", "get_world_size", "get_rank", "all_reduce")
+        )
+        and dist.is_initialized()
+    )
     world = dist.get_world_size(group) if distributed else 1
     rank = dist.get_rank(group) if distributed else 0
     if world == 1:
@@ -301,8 +306,7 @@ def canonical_training_metadata(
         )
         error_type, message = failure[0]
         raise RuntimeError(
-            f"Training row {first_failure} preprocessing failed "
-            f"with {error_type}: {message}"
+            f"Training row {first_failure} preprocessing failed with {error_type}: {message}"
         )
 
     lengths = torch.tensor(local_lengths, device=device, dtype=torch.int64)
@@ -311,9 +315,7 @@ def canonical_training_metadata(
     if any(length < 0 for length in canonical_lengths):
         raise RuntimeError("Canonical metadata exchange left unowned training rows")
     usable = [
-        index
-        for index, canonical_length in enumerate(canonical_lengths)
-        if canonical_length > 0
+        index for index, canonical_length in enumerate(canonical_lengths) if canonical_length > 0
     ]
     return canonical_lengths, usable
 
@@ -1082,7 +1084,8 @@ def _run(argv: list[str] | None = None) -> None:
             "step": step,
             "accuracy": (stats[0] / stats[2]).item(),
             "cross_entropy": (stats[1] / stats[2]).item(),
-            "rows": int(stats[2].item()),
+            "rows": len(validation),
+            "questions": int(stats[2].item()),
         }
         log("validation.jsonl", record)
         return record

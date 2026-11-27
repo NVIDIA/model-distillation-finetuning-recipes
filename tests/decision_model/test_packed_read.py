@@ -20,8 +20,8 @@ from scripts.decision_model.runtime import (
     load_prompt_module,
     packed_attention,
     packed_block_mask,
-    packed_mask_mod,
     packed_layout,
+    packed_mask_mod,
     packed_option_logits,
     packed_state_length,
 )
@@ -229,6 +229,35 @@ def test_packed_reads_need_a_shared_state_boundary(tmp_path):
         DecisionRows(tokenizer(), prompt_file(tmp_path, missing), 64, packed_read=True)
 
 
+def test_packed_rows_reject_a_literal_state_separator_in_the_state(tmp_path):
+    tok = tokenizer((1, STATE_END, 2, STATE_END))
+    rows = DecisionRows(tok, prompt_file(tmp_path), 64, packed_read=True)
+    with pytest.raises(ValueError, match="exactly one state-end token"):
+        rows(packed_row())
+    tok.unk_token_id = STATE_END
+    with pytest.raises(ValueError, match="known to the tokenizer"):
+        DecisionRows(tok, prompt_file(tmp_path), 64, packed_read=True)
+
+
+@pytest.mark.parametrize("mapped", [{"first": "y"}, {"first": "x"}, None])
+def test_ambiguous_targets_rejected_across_entry_points(tmp_path, mapped):
+    from scripts.decision_model.score import score_all
+    from scripts.decision_model.split_packed import row_labels
+    from scripts.decision_model.validate_checkpoint import first_question_row
+
+    row = packed_row(("first",))
+    row["reference"] = {"target": "x", "targets": mapped}
+    for packed in (False, True):
+        prepare = DecisionRows(tokenizer(), prompt_file(tmp_path), 64, packed_read=packed)
+        with pytest.raises(ValueError, match="both reference.target and reference.targets"):
+            prepare(row)
+    with pytest.raises(ValueError, match="both reference.target and reference.targets"):
+        score_all([row], [{"id": row["id"], "probs": {"x": 1.0, "y": 0.0}}], None)
+    for read in (row_labels, first_question_row):
+        with pytest.raises(ValueError, match="both reference.target and reference.targets"):
+            read(row)
+
+
 def test_single_read_rejects_multi_question_rows_as_before(tmp_path):
     with pytest.raises(ValueError, match="exactly one input question"):
         DecisionRows(tokenizer(), prompt_file(tmp_path), 64)(packed_row())
@@ -409,6 +438,24 @@ def test_flex_packed_attention_requires_matching_options():
         TRAINER.parse_args([*base, "--packed-attention", "flex"])
     with pytest.raises(SystemExit):
         TRAINER.parse_args([*base, "--packed-read", "--packed-attention", "flex"])
+
+
+def test_packed_flash_attention_rejected_by_all_three_commands(capsys):
+    from scripts.decision_model import evaluate, validate_checkpoint
+
+    for parse, command in (
+        (TRAINER.parse_args, ["--method", "lora", "--train", "t", "--output", "o"]),
+        (evaluate.parse_args, ["--input", "t", "--output-dir", "o"]),
+        (validate_checkpoint.parse_args, ["--data", "t"]),
+    ):
+        base = ["--checkpoint", "m", *command]
+        assert parse([*base, "--packed-read"]).attn_implementation == "sdpa"
+        flash = ["--attn-implementation", "flash_attention_2"]
+        assert not parse([*base, *flash]).packed_read
+        with pytest.raises(SystemExit) as error:
+            parse([*base, *flash, "--packed-read"])
+        assert error.value.code == 2
+        assert "--packed-read needs a query-by-key attention mask" in capsys.readouterr().err
 
 
 class WordTokenizer:

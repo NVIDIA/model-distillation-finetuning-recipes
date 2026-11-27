@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.decision_model.checkpoint_manifest import file_sha256, weight_manifest
+from scripts.decision_model.cli import check_packed_attention
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -110,6 +111,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    check_packed_attention(parser, args)
     if args.max_tokens < 1:
         parser.error("--max-tokens must be positive")
     try:
